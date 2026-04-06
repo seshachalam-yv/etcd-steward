@@ -29,3 +29,4 @@ hack/local-dev/config/kind.config.yaml
 
 # Go workspace file
 go.work
+.claude/worktrees/

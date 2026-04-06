@@ -31,14 +31,14 @@ var ErrNoSnapshotFound = errors.New("no full snapshot found in snapstore")
 //  3. Find all Incremental snapshots after the full snapshot (delta replay is stubbed for Phase 2)
 //  4. Move the restored DB to dataDir/member/snap/db
 func Restore(
-	ctx context.Context,
+	_ context.Context,
 	store snapstore.Snapstore,
 	compressor compression.Compressor,
 	dataDir string,
 	tempDir string,
-	memberName string,
-	peerURL string,
-	initialCluster string,
+	_ string,
+	_ string,
+	_ string,
 	logger *zap.Logger,
 ) error {
 	snaps, err := store.List()

@@ -21,7 +21,7 @@ func newTestServer(status initializer.InitializationStatus) *Server {
 	return NewServer(
 		0,
 		func() initializer.InitializationStatus { return status },
-		func(ctx context.Context, mode string) error { return nil },
+		func(_ context.Context, _ string) error { return nil },
 		func() ([]byte, error) { return []byte("name: etcd-main"), nil },
 		nil, // no snapshotter
 		nil, // no store
@@ -157,7 +157,7 @@ func TestHandleInitializationStart_Successful(t *testing.T) {
 	s := NewServer(
 		0,
 		func() initializer.InitializationStatus { return initializer.InitializationStatusSuccessful },
-		func(ctx context.Context, mode string) error { return nil },
+		func(_ context.Context, _ string) error { return nil },
 		nil,
 		nil, nil,
 		zap.NewNop(),
@@ -204,7 +204,7 @@ func TestHandleSnapshotLatest_WithStore(t *testing.T) {
 	s := NewServer(
 		0,
 		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
-		func(ctx context.Context, mode string) error { return nil },
+		func(_ context.Context, _ string) error { return nil },
 		nil,
 		nil,
 		store,

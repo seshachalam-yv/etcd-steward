@@ -133,13 +133,13 @@ func TestValidate(t *testing.T) {
 		{
 			name:      "sanity mode missing DB is valid",
 			mode:      ValidationModeSanity,
-			setupDB:   func(t *testing.T, dataDir string) {},
+			setupDB:   func(_ *testing.T, _ string) {},
 			wantValid: true,
 		},
 		{
 			name:      "full mode missing DB is valid",
 			mode:      ValidationModeFull,
-			setupDB:   func(t *testing.T, dataDir string) {},
+			setupDB:   func(_ *testing.T, _ string) {},
 			wantValid: true,
 		},
 		{

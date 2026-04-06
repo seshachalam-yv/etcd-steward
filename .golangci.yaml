@@ -1,6 +1,7 @@
+version: "2"
 run:
   concurrency: 4
-  deadline: 10m
+  timeout: 10m
 
 linters:
   disable:
@@ -29,3 +30,9 @@ issues:
     - linters:
         - staticcheck
       text: "SA1019:" # Excludes messages where deprecated variables are used
+    - linters:
+        - staticcheck
+      text: "QF1006:" # Loop condition pattern: intentional structure with select inside
+    - linters:
+        - revive
+      text: "stutters;" # SnapstoreConfig stutter is intentional for clarity

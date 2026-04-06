@@ -40,7 +40,7 @@ type mockClusterClient struct {
 	wasMemberErr     error
 }
 
-func (m *mockClusterClient) AddLearner(_ context.Context, peerURL string) (uint64, error) {
+func (m *mockClusterClient) AddLearner(_ context.Context, _ string) (uint64, error) {
 	return m.addLearnerID, m.addLearnerErr
 }
 
@@ -57,7 +57,7 @@ func (m *mockClusterClient) ListMembers(_ context.Context) ([]etcdclient.Member,
 	return m.members, nil
 }
 
-func (m *mockClusterClient) WasMemberInCluster(_ context.Context, peerURL string) (bool, error) {
+func (m *mockClusterClient) WasMemberInCluster(_ context.Context, _ string) (bool, error) {
 	return m.wasMemberResult, m.wasMemberErr
 }
 
@@ -102,10 +102,7 @@ func TestInitializer_SingleNode_HappyPath(t *testing.T) {
 
 	// Wait for async initialization.
 	deadline := time.After(5 * time.Second)
-	for {
-		if init.GetStatus() == InitializationStatusSuccessful {
-			break
-		}
+	for init.GetStatus() != InitializationStatusSuccessful {
 		select {
 		case <-deadline:
 			t.Fatalf("initialization did not complete, status: %s", init.GetStatus())
@@ -164,10 +161,7 @@ func TestInitializer_LearnerJoin_HappyPath(t *testing.T) {
 
 	// Wait for initialization to succeed.
 	deadline := time.After(5 * time.Second)
-	for {
-		if init.GetStatus() == InitializationStatusSuccessful {
-			break
-		}
+	for init.GetStatus() != InitializationStatusSuccessful {
 		select {
 		case <-deadline:
 			t.Fatalf("initialization did not complete, status: %s", init.GetStatus())
@@ -240,10 +234,7 @@ func TestInitializer_MultiNode_DataLoss_TriggersRecovery(t *testing.T) {
 
 	// Wait for initialization.
 	deadline := time.After(5 * time.Second)
-	for {
-		if init.GetStatus() == InitializationStatusSuccessful {
-			break
-		}
+	for init.GetStatus() != InitializationStatusSuccessful {
 		select {
 		case <-deadline:
 			t.Fatalf("initialization did not complete, status: %s", init.GetStatus())

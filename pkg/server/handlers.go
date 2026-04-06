@@ -157,7 +157,7 @@ func (s *Server) handleInitializationStart(w http.ResponseWriter, r *http.Reques
 			status := s.statusFn()
 			if status == initializer.InitializationStatusSuccessful {
 				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, "Successful\n")
+				fmt.Fprint(w, "Successful\n") //nolint:errcheck
 				return
 			}
 		}
@@ -171,7 +171,7 @@ func (s *Server) handleInitializationStatus(w http.ResponseWriter, r *http.Reque
 	}
 	status := s.statusFn()
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, string(status))
+	fmt.Fprint(w, string(status)) //nolint:errcheck
 }
 
 func (s *Server) handleSnapshotFull(w http.ResponseWriter, r *http.Request) {
@@ -253,11 +253,11 @@ func (s *Server) handleSnapshotLatest(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp) //nolint:errcheck
 }
 
-func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	if s.isShutdown.Load() {
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "ok")
+	fmt.Fprint(w, "ok") //nolint:errcheck
 }

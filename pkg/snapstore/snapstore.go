@@ -40,7 +40,7 @@ type Snapstore interface {
 }
 
 // SnapstoreConfig holds configuration for creating a Snapstore instance.
-type SnapstoreConfig struct {
+type SnapstoreConfig struct { //nolint:revive // name intentionally includes package prefix for clarity
 	Provider         string
 	Container        string
 	Prefix           string

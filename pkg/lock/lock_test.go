@@ -175,7 +175,18 @@ func TestLock_AcquireContention(t *testing.T) {
 		done <- l2.Acquire(ctx)
 	}()
 
-	// Release the first lock.
+	// Wait until l2 has registered a watcher — this guarantees l2 has entered the
+	// watch loop and is blocked waiting for the lock to be released. Without this
+	// synchronisation l1.Release could run before l2 even calls Txn, meaning the
+	// watch path is never exercised.
+	select {
+	case <-api.watchStarted:
+	case err := <-done:
+		// l2 succeeded without going through the watch path — unexpected.
+		t.Fatalf("l2.Acquire completed unexpectedly before l1 released: %v", err)
+	}
+
+	// Release the first lock — this sends a delete event to l2's watcher.
 	if err := l1.Release(ctx); err != nil {
 		t.Fatalf("l1.Release failed: %v", err)
 	}
@@ -333,17 +344,30 @@ func TestLock_ContextCancelledDuringWatch(t *testing.T) {
 	}
 
 	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- l2.Acquire(watchCtx)
 	}()
 
-	// Give the goroutine time to reach the watch loop, then cancel.
-	// We use a small sleep here — the only acceptable use in tests where
-	// we need to synchronize with an internal goroutine state.
-	// There is no synchronization primitive exposed for the watch-loop entry.
+	// Wait until l2 has registered a watcher — l2 is now blocked in the watch loop.
+	// Cancel the context to unblock it.
+	<-api.watchStarted
+
+	// Now close l2's watcher channel to unblock the for-range loop, then l2 will check
+	// ctx.Err(). We cancel first so the error is set before the channel drains.
 	cancel()
+
+	// Also close the watcher channel so the for-range loop exits.
+	api.mu.Lock()
+	for _, chs := range api.watchers {
+		for _, ch := range chs {
+			close(ch)
+		}
+	}
+	api.watchers = make(map[string][]chan clientv3.WatchResponse)
+	api.mu.Unlock()
 
 	err := <-errCh
 	if err == nil {
@@ -353,5 +377,35 @@ func TestLock_ContextCancelledDuringWatch(t *testing.T) {
 	// Cleanup.
 	if err := l1.Release(ctx); err != nil {
 		t.Fatalf("l1.Release failed: %v", err)
+	}
+}
+
+// fakeEtcdAPIWithRevokeErr wraps fakeEtcdAPI and injects a Revoke error.
+type fakeEtcdAPIWithRevokeErr struct {
+	*fakeEtcdAPI
+	revokeErr error
+}
+
+func (f *fakeEtcdAPIWithRevokeErr) Revoke(ctx context.Context, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
+	if f.revokeErr != nil {
+		return nil, f.revokeErr
+	}
+	return f.fakeEtcdAPI.Revoke(ctx, id)
+}
+
+// TestLock_ReleaseRevokeError verifies that Release propagates a Revoke failure.
+func TestLock_ReleaseRevokeError(t *testing.T) {
+	base := newFakeEtcdAPI()
+	revokeErr := fmt.Errorf("etcd is down")
+	api := &fakeEtcdAPIWithRevokeErr{fakeEtcdAPI: base, revokeErr: revokeErr}
+
+	l := NewWithAPI(api, "default", "etcd-main")
+
+	// Manually set a leaseID so Release thinks a lease is held.
+	l.leaseID = 42
+
+	err := l.Release(context.Background())
+	if err == nil {
+		t.Fatal("expected error from Release when Revoke fails")
 	}
 }

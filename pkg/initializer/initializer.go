@@ -8,6 +8,7 @@ package initializer
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,6 +70,10 @@ type Initializer struct {
 	store         snapstore.Snapstore    // nil if no backup configured
 	compressor    compression.Compressor // nil if no backup configured
 
+	// tcpDialFn is called to check if the etcd endpoint is TCP-reachable.
+	// Defaults to net.Dialer.DialContext; overridable in tests.
+	tcpDialFn func(ctx context.Context, network, addr string) (net.Conn, error)
+
 	status    atomic.Value // stores InitializationStatus
 	startOnce sync.Once
 
@@ -108,6 +113,7 @@ func New(
 		logger:                       logger,
 		store:                        store,
 		compressor:                   compressor,
+		tcpDialFn:                    (&net.Dialer{}).DialContext,
 	}
 	i.status.Store(InitializationStatusNew)
 	return i
@@ -308,15 +314,93 @@ func (i *Initializer) isDataDirEmpty() bool {
 }
 
 // needsDataLossRecovery returns true if this member needs to rejoin the cluster as a learner.
+// Returns false when the cluster is unreachable (fresh bootstrap — no cluster exists yet).
 func (i *Initializer) needsDataLossRecovery(ctx context.Context) (bool, error) {
-	if i.isDataDirEmpty() {
-		return true, nil
+	// Fast TCP check first — avoids the gRPC connection-establishment hang when no etcd is running.
+	if !i.isEtcdReachable(ctx) {
+		i.logger.Info("cluster not reachable via TCP, skipping data-loss check",
+			zap.String("member", i.memberName),
+		)
+		return false, nil
 	}
-	wasInCluster, err := i.clusterClient.WasMemberInCluster(ctx, i.peerURL)
+
+	if !i.isDataDirEmpty() {
+		// Non-empty data dir: check if THIS member is still registered in the cluster.
+		// If not, it was removed and needs to rejoin.
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		wasInCluster, err := i.clusterClient.WasMemberInCluster(checkCtx, i.peerURL)
+		if err != nil {
+			return false, fmt.Errorf("failed to query cluster membership: %w", err)
+		}
+		return !wasInCluster, nil
+	}
+	// Data dir is empty — do a full membership query to check for data-loss recovery.
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	members, err := i.clusterClient.ListMembers(checkCtx)
 	if err != nil {
-		return false, fmt.Errorf("failed to query cluster membership: %w", err)
+		// Cluster not reachable → fresh bootstrap, not data-loss recovery.
+		i.logger.Info("cluster not reachable, treating empty data dir as fresh bootstrap",
+			zap.String("member", i.memberName),
+			zap.Error(err),
+		)
+		return false, nil
 	}
-	return !wasInCluster, nil
+	// Cluster is reachable and data dir is empty → data-loss recovery.
+	for _, m := range members {
+		for _, u := range m.PeerURLs {
+			if u == i.peerURL {
+				return true, nil
+			}
+		}
+	}
+	// Data dir empty and not in cluster → joining as new member (scale-up handled elsewhere).
+	return false, nil
+}
+
+// isEtcdReachable checks if the etcd client endpoint is reachable via TCP within 3 seconds.
+// This avoids blocking on gRPC connection establishment when no etcd cluster exists yet.
+func (i *Initializer) isEtcdReachable(ctx context.Context) bool {
+	addr := i.etcdTCPAddr()
+	if addr == "" {
+		return false
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	conn, err := i.tcpDialFn(dialCtx, "tcp", addr)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// etcdTCPAddr extracts the host:port from the etcd endpoint URL.
+func (i *Initializer) etcdTCPAddr() string {
+	ep := i.etcdEndpoint
+	// Strip scheme prefix.
+	for _, prefix := range []string{"https://", "http://"} {
+		if len(ep) > len(prefix) && ep[:len(prefix)] == prefix {
+			ep = ep[len(prefix):]
+			break
+		}
+	}
+	// Strip trailing path.
+	if idx := indexOf(ep, '/'); idx >= 0 {
+		ep = ep[:idx]
+	}
+	return ep
+}
+
+// indexOf returns the index of the first occurrence of b in s, or -1.
+func indexOf(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }
 
 // initializeDataLossRecovery handles the case where a multi-node member's PVC was deleted.

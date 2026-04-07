@@ -29,6 +29,8 @@ type Snapshotter interface {
 // Server is the HTTP server for etcd-steward.
 type Server struct {
 	port        int
+	certFile    string
+	keyFile     string
 	mux         *http.ServeMux
 	statusFn    func() initializer.InitializationStatus
 	startFn     func(ctx context.Context, mode string) error
@@ -50,8 +52,24 @@ func NewServer(
 	store snapstore.Snapstore,
 	logger *zap.Logger,
 ) *Server {
+	return NewServerWithTLS(port, "", "", statusFn, startFn, configFn, snapshotter, store, logger)
+}
+
+// NewServerWithTLS creates a Server that serves HTTPS when certFile and keyFile are non-empty.
+func NewServerWithTLS(
+	port int,
+	certFile, keyFile string,
+	statusFn func() initializer.InitializationStatus,
+	startFn func(ctx context.Context, mode string) error,
+	configFn func() ([]byte, error),
+	snapshotter Snapshotter,
+	store snapstore.Snapstore,
+	logger *zap.Logger,
+) *Server {
 	s := &Server{
 		port:        port,
+		certFile:    certFile,
+		keyFile:     keyFile,
 		mux:         http.NewServeMux(),
 		statusFn:    statusFn,
 		startFn:     startFn,
@@ -86,9 +104,16 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		s.logger.Info("starting HTTP server", zap.Int("port", s.port))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+		if s.certFile != "" && s.keyFile != "" {
+			s.logger.Info("starting HTTPS server", zap.Int("port", s.port))
+			if err := srv.ListenAndServeTLS(s.certFile, s.keyFile); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		} else {
+			s.logger.Info("starting HTTP server", zap.Int("port", s.port))
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
 		}
 		close(errCh)
 	}()
@@ -125,7 +150,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInitializationStart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	// Accept both GET (etcd-wrapper compat) and POST.
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -140,6 +166,15 @@ func (s *Server) handleInitializationStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// GET is etcd-wrapper's fire-and-forget trigger — return immediately.
+	// etcd-wrapper polls /initialization/status separately to detect completion.
+	if r.Method == http.MethodGet {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK\n") //nolint:errcheck
+		return
+	}
+
+	// POST blocks until Successful (used by tests and direct callers).
 	// Poll until successful or timeout.
 	timeout := time.After(5 * time.Minute)
 	ticker := time.NewTicker(100 * time.Millisecond)

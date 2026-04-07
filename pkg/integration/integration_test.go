@@ -256,11 +256,14 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		}
 	})
 
-	// 9. wrong method on /initialization/start → 405
+	// 9. wrong method on /initialization/start → 405 (DELETE is not accepted)
 	t.Run("wrong method rejected", func(t *testing.T) {
-		resp, err := client.Get(base + "/initialization/start")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/initialization/start", nil)
+		resp, err := client.Do(req)
 		if err != nil {
-			t.Fatalf("GET /initialization/start: %v", err)
+			t.Fatalf("DELETE /initialization/start: %v", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusMethodNotAllowed {

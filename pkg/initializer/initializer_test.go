@@ -6,6 +6,7 @@ package initializer
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -203,10 +204,24 @@ func TestInitializer_MultiNode_DataLoss_TriggersRecovery(t *testing.T) {
 	dataDir := t.TempDir()
 	// Empty data dir triggers data-loss detection.
 
+	// Start a TCP listener to simulate a reachable etcd endpoint.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start TCP listener: %v", err)
+	}
+	defer ln.Close()
+	listenAddr := ln.Addr().String()
+
 	rec := &mockRecorder{}
 	cc := &mockClusterClient{
 		addLearnerID:    12345,
 		wasMemberResult: false, // Not in cluster.
+		// Simulate reachable cluster that already has etcd-main-1 as a member
+		// (data-loss scenario: PVC was deleted but member still registered in cluster).
+		members: []etcdclient.Member{
+			{ID: 1, PeerURLs: []string{"https://etcd-main-0:2380"}},
+			{ID: 2, PeerURLs: []string{"https://etcd-main-1:2380"}},
+		},
 	}
 
 	init := New(
@@ -220,10 +235,12 @@ func TestInitializer_MultiNode_DataLoss_TriggersRecovery(t *testing.T) {
 		&member.NoopClient{},
 		cc,
 		nil,
-		"http://localhost:2379",
+		"http://"+listenAddr,
 		zap.NewNop(),
 		nil, nil,
 	)
+	// Inject a TCP dial function that connects to the test listener.
+	init.tcpDialFn = (&net.Dialer{}).DialContext
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

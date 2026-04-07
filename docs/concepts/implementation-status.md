@@ -156,6 +156,13 @@ This document tracks the completion status of each feature relative to the requi
 
 **Complete:** `pkg/initializer` implements the full DEP-04 lifecycle with paths A–D. TCP pre-check avoids gRPC hang when peers are unreachable. Learner join + promotion is implemented. State transitions are persisted synchronously before each step.
 
+DEP-04 state machine compliance (all fixed):
+- ✅ `New` state recorded as the first transition on every startup
+- ✅ Multi-node DB validation failure → `New` → remove data dir → remove stale member → learner re-join (no more infinite restart loop)
+- ✅ Scale-up path records `Initializing` state before `PendingLearner`
+- ✅ Data-loss recovery records `New/DataLossRecoveryStarted` distinguishable from normal scale-up
+- ✅ `EtcdMember.status.lastRestoration` populated after snapshot restoration (success and failure)
+
 **Gaps:**
 - Partial restoration (Path D with delta replay) deferred to #11.
 - Multi-node revision validation specifics deferred to #13.
@@ -164,10 +171,16 @@ This document tracks the completion status of each feature relative to the requi
 
 ### #15 — EtcdMember status updation
 
-**Complete:** State transitions are written synchronously to `EtcdMember.status.transitions` via K8s patch before control flow advances. `EtcdMember.status` is owned exclusively by etcd-steward.
+**Complete:** State transitions are written synchronously to `EtcdMember.status.transitions` via K8s patch before control flow advances. `EtcdMember.status` is owned exclusively by etcd-steward. `lastRestoration` is populated after snapshot restoration.
+
+The `EtcdMember` API types in etcd-druid now include the full DEP-04 status schema:
+- `snapshots.lastFull`, `snapshots.lastDelta`, `snapshots.accumulatedDeltaSize` (for compaction controller)
+- `lastDefragmentation` (startTime, endTime, initialDBSize, finalDBSize, reason, message)
+- `DataLossRecoveryStarted` reason code for distinguishing data-loss re-joins from normal scale-ups
 
 **Gaps:**
-- Async status fields are not populated: `lastFullSnapshot`, `lastDeltaSnapshot`, `lastDefragmentation` timestamps are not written back after operations complete.
+- `snapshots.*` fields not yet populated by the snapshotter (API fields exist but write path not implemented).
+- `lastDefragmentation` not yet populated by alarm handler (API fields exist but write path not implemented).
 - No async update pipeline from snapshotter/alarm handler back to EtcdMember status.
 
 ---

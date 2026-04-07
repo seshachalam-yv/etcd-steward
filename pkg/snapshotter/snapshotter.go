@@ -310,7 +310,10 @@ func (s *Snapshotter) RunDeltaSnapshotLoop(ctx context.Context, period time.Dura
 
 // getCurrentRevision queries etcd for the current revision.
 func (s *Snapshotter) getCurrentRevision(ctx context.Context) (int64, error) {
-	resp, err := s.kvAPI.Get(ctx, "", clientv3.WithLimit(1))
+	// Use the null-byte key with WithFromKey so we get the Header.Revision
+	// without triggering "key is not provided" — equivalent to a range scan
+	// from the first key in the keyspace (0 results if empty).
+	resp, err := s.kvAPI.Get(ctx, "\x00", clientv3.WithFromKey(), clientv3.WithLimit(1))
 	if err != nil {
 		return 0, err
 	}

@@ -7,6 +7,7 @@ package member
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+
+	"github.com/gardener/etcd-steward/pkg/statemachine"
 )
 
 // mockDynamicClient implements dynamic.Interface for testing.
@@ -240,4 +243,123 @@ func TestRemoveCreateAsLearnerAnnotation(t *testing.T) {
 	if val != nil {
 		t.Errorf("annotation value must be null, got %v", val)
 	}
+}
+
+// errPatchResourceClient always returns an error from Patch.
+type errPatchResourceClient struct {
+	mockResourceClient
+}
+
+func (e *errPatchResourceClient) Namespace(_ string) dynamic.ResourceInterface {
+	return e
+}
+
+func (e *errPatchResourceClient) Patch(_ context.Context, _ string, _ types.PatchType, _ []byte, _ metav1.PatchOptions, _ ...string) (*unstructured.Unstructured, error) {
+	return nil, fmt.Errorf("patch failed: not found")
+}
+
+type errDynamicClient struct {
+	resource *errPatchResourceClient
+}
+
+func (e *errDynamicClient) Resource(_ schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return e.resource
+}
+
+func newErrMockClient() *K8sMemberClient {
+	rc := &errPatchResourceClient{}
+	mc := &errDynamicClient{resource: rc}
+	return &K8sMemberClient{client: mc}
+}
+
+func TestUpdateStatus_PatchError(t *testing.T) {
+	client := newErrMockClient()
+
+	id := "abc123"
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{
+		MemberID: &id,
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !containsString(err.Error(), "failed to patch") {
+		t.Errorf("expected error to contain 'failed to patch', got: %v", err)
+	}
+}
+
+func TestRemoveCreateAsLearnerAnnotation_PatchError(t *testing.T) {
+	client := newErrMockClient()
+
+	err := client.RemoveCreateAsLearnerAnnotation(context.Background(), "etcd-main-0", "default")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !containsString(err.Error(), "failed to patch") {
+		t.Errorf("expected error to contain 'failed to patch', got: %v", err)
+	}
+}
+
+func TestNoopClient_UpdateStatus(t *testing.T) {
+	c := &NoopClient{}
+	err := c.UpdateStatus(context.Background(), "member", "ns", UpdateStatusOpts{})
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestNoopClient_RemoveCreateAsLearnerAnnotation(t *testing.T) {
+	c := &NoopClient{}
+	err := c.RemoveCreateAsLearnerAnnotation(context.Background(), "member", "ns")
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestNewK8sClient_ReturnsClient(t *testing.T) {
+	rc := &mockResourceClient{}
+	mc := &mockDynamicClient{resource: rc}
+	c := NewK8sClient(mc)
+	if c == nil {
+		t.Fatal("expected non-nil client")
+	}
+}
+
+func TestUpdateStatus_WithLastTransition(t *testing.T) {
+	client, rc := newMockClient()
+
+	id := "abc123"
+	tr := &statemachine.Transition{
+		State:  statemachine.StateStarted,
+		Reason: statemachine.ReasonJoinedAsLearner,
+	}
+
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{
+		MemberID:       &id,
+		LastTransition: tr,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+
+	statusMap := patch["status"].(map[string]interface{})
+	if _, has := statusMap["lastTransition"]; !has {
+		t.Error("expected lastTransition in patch status")
+	}
+}
+
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}())
 }

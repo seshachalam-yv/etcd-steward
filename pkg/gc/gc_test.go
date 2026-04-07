@@ -224,3 +224,192 @@ func TestGroupIntoSets(t *testing.T) {
 		})
 	}
 }
+
+// errSnapstore is a mockSnapstore variant whose List always returns an error.
+type errSnapstore struct{}
+
+func (e *errSnapstore) Save(_ snapstore.Snapshot, _ io.ReadCloser) error { return nil }
+func (e *errSnapstore) Fetch(_ snapstore.Snapshot) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (e *errSnapstore) List() ([]snapstore.Snapshot, error) {
+	return nil, fmt.Errorf("list error")
+}
+func (e *errSnapstore) Delete(_ snapstore.Snapshot) error { return nil }
+
+func TestCollect_ListError(t *testing.T) {
+	gc := New(&errSnapstore{}, 3, zap.NewNop())
+	err := gc.Collect(context.Background())
+	if err == nil {
+		t.Fatal("expected error from List, got nil")
+	}
+}
+
+// deleteErrSnapstore records deletes but returns an error for every Delete call.
+type deleteErrSnapstore struct {
+	snaps   []snapstore.Snapshot
+	deleted []snapstore.Snapshot
+}
+
+func (d *deleteErrSnapstore) Save(_ snapstore.Snapshot, _ io.ReadCloser) error { return nil }
+func (d *deleteErrSnapstore) Fetch(_ snapstore.Snapshot) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (d *deleteErrSnapstore) List() ([]snapstore.Snapshot, error) { return d.snaps, nil }
+func (d *deleteErrSnapstore) Delete(snap snapstore.Snapshot) error {
+	d.deleted = append(d.deleted, snap)
+	return fmt.Errorf("delete error for %s", snap.SnapName)
+}
+
+func TestCollect_DeleteFullError_ContinuesWithIncrementals(t *testing.T) {
+	// 3 sets, keep 1 → delete 2. Errors on delete should be logged and execution continues.
+	store := &deleteErrSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Full", 0, 100),
+			snap("Incremental", 100, 150),
+			snap("Full", 0, 200),
+			snap("Incremental", 200, 250),
+			snap("Full", 0, 300),
+		},
+	}
+	gc := New(store, 1, zap.NewNop())
+	// Collect should not return error even when individual deletes fail.
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("expected no error from Collect when Delete fails, got: %v", err)
+	}
+	// All 4 deletes should have been attempted (Full@100, Incr@150, Full@200, Incr@250).
+	if len(store.deleted) != 4 {
+		t.Errorf("expected 4 delete attempts, got %d", len(store.deleted))
+	}
+}
+
+func TestCollect_ExactlyMaxPlusOne_DeletesOneSet(t *testing.T) {
+	// maxFullSnapshots=2, 3 sets → delete exactly 1 oldest set.
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Full", 0, 100),
+			snap("Incremental", 100, 150),
+			snap("Full", 0, 200),
+			snap("Incremental", 200, 250),
+			snap("Full", 0, 300),
+		},
+	}
+	gc := New(store, 2, zap.NewNop())
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+	// Set 0: Full@100 + Incr@150 → 2 deletes
+	if len(store.deleted) != 2 {
+		t.Fatalf("expected 2 deletes, got %d", len(store.deleted))
+	}
+	for _, d := range store.deleted {
+		if d.LastRevision != 100 && d.LastRevision != 150 {
+			t.Errorf("unexpected revision deleted: %d", d.LastRevision)
+		}
+	}
+}
+
+func TestCollect_ContextCancelledAfterCollection(t *testing.T) {
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Full", 0, 100),
+			snap("Full", 0, 200),
+			snap("Full", 0, 300),
+			snap("Full", 0, 400),
+		},
+	}
+	gc := New(store, 2, zap.NewNop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so ctx.Err() is set before Collect checks it
+
+	err := gc.Collect(ctx)
+	if err == nil {
+		t.Fatal("expected context error, got nil")
+	}
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got: %v", err)
+	}
+}
+
+func TestCollect_OrphanIncrementalsWithinLimit(t *testing.T) {
+	// 2 sets (orphan + Full@100), keep 2 → no deletions
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Incremental", 50, 80),
+			snap("Full", 0, 100),
+		},
+	}
+	gc := New(store, 2, zap.NewNop())
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+	if len(store.deleted) != 0 {
+		t.Errorf("expected 0 deletes when within limit, got %d", len(store.deleted))
+	}
+}
+
+func TestRun_SkipsCollectWhenNotLeader(t *testing.T) {
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Full", 0, 100),
+			snap("Full", 0, 200),
+			snap("Full", 0, 300),
+			snap("Full", 0, 400),
+		},
+	}
+	gc := New(store, 1, zap.NewNop())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	gc.Run(ctx, 10*time.Millisecond, func() bool { return false })
+
+	if len(store.deleted) != 0 {
+		t.Errorf("expected no deletes when not leader, got %d", len(store.deleted))
+	}
+}
+
+func TestRun_CallsCollectWhenLeader(t *testing.T) {
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snap("Full", 0, 100),
+			snap("Full", 0, 200),
+			snap("Full", 0, 300),
+			snap("Full", 0, 400),
+		},
+	}
+	gc := New(store, 1, zap.NewNop())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// isLeader returns true: collection should run and delete old sets.
+	gc.Run(ctx, 10*time.Millisecond, func() bool { return true })
+
+	if len(store.deleted) == 0 {
+		t.Error("expected deletes when leader, got none")
+	}
+}
+
+func TestRun_ExitsOnContextCancel(t *testing.T) {
+	store := &mockSnapstore{}
+	gc := New(store, 3, zap.NewNop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		gc.Run(ctx, 10*time.Millisecond, func() bool { return false })
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+		// ok, Run returned after cancel
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
+	}
+}

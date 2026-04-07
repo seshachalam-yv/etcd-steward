@@ -103,26 +103,44 @@ All variants complete within 78s. `UseEtcdSteward` gate enabled. EtcdMember CRs 
 
 ```
 make check:  0 issues (golangci-lint v2.6.2)
-make test:   all packages ok
-  pkg/alarm            ok
-  pkg/compression      ok
-  pkg/config           ok
-  pkg/etcdclient       ok
-  pkg/gc               ok
-  pkg/initializer      ok (5 tests)
-  pkg/integration      ok (3 test functions, 9+1+1 sub-tests)
-  pkg/leaderwatch      ok
-  pkg/lease            ok
-  pkg/lock             ok
-  pkg/member           ok
-  pkg/restoration      ok
-  pkg/server           ok
-  pkg/snapshotlease    ok
-  pkg/snapshotter      ok
-  pkg/snapstore        ok
-  pkg/statemachine     ok
-  pkg/validator        ok
+make test:   all packages ok (with coverage)
+
+  pkg/alarm            ok  97.8%
+  pkg/compression      ok  80.8%
+  pkg/config           ok  100.0%
+  pkg/etcdclient       ok  78.0%
+  pkg/gc               ok  97.8%
+  pkg/initializer      ok  80.7%
+  pkg/integration      ok  (3 test functions, 9+1+1 sub-tests)
+  pkg/leaderwatch      ok  82.5%
+  pkg/lease            ok  78.1%
+  pkg/lock             ok  90.9%
+  pkg/member           ok  92.3%
+  pkg/restoration      ok  84.5%
+  pkg/server           ok  84.7%
+  pkg/snapshotlease    ok  74.5%
+  pkg/snapshotter      ok  69.7%
+  pkg/snapstore        ok  76.9%
+  pkg/statemachine     ok  81.6%
+  pkg/validator        ok  87.1%
 ```
+
+### Unit test expansion (2026-04-07)
+
+Additional unit tests were written to improve coverage from prior low baselines:
+- `pkg/alarm`: 64% → 97.8% — added error paths, CORRUPT/NOSPACE combinations, Run() lifecycle
+- `pkg/server`: 54% → 84.7% — added method validation, error paths, snapshot handlers, nil configFn
+- `pkg/lock`: 47% → 90.9% — added grant/txn/revoke error paths, contention, context cancel
+- `pkg/gc`: 68% → 97.8% — added cleanup, stale-member detection, error paths
+- `pkg/member`: 69% → 92.3% — added K8s client CRUD, status update, not-found handling
+- `pkg/restoration`: 60% → 84.5% — added fetch/save/decompress paths
+- `pkg/initializer`: 57% → 80.7% — added data-loss decision tree, peer-probe, idempotent restart
+
+#### Recovery bug fix (2026-04-07)
+
+`isEtcdReachable` was probing the local etcd endpoint (`self:2379`) before peer addresses. On a corrupted 3-node member, local etcd is DOWN — so the probe failed → `isEtcdReachable=false` → data-loss check skipped → fresh bootstrap → etcd rejected with "member already bootstrapped".
+
+Fix: `clusterTCPAddrs()` now iterates `initial-cluster`, skips self, converts peer port 2380→2379 for client connectivity check, then falls back to local. Corrupted members correctly detect the cluster is still alive via peers.
 
 ---
 

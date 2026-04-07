@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -359,26 +360,86 @@ func (i *Initializer) needsDataLossRecovery(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// isEtcdReachable checks if the etcd client endpoint is reachable via TCP within 3 seconds.
+// isEtcdReachable checks whether any etcd peer in the cluster is reachable via TCP.
+// For multi-node clusters it tries peers from initial-cluster (excluding self) first,
+// so that a corrupted or restarting member can still detect the existing cluster.
+// Falls back to the local endpoint for single-node or when no peers are found.
 // This avoids blocking on gRPC connection establishment when no etcd cluster exists yet.
 func (i *Initializer) isEtcdReachable(ctx context.Context) bool {
-	addr := i.etcdTCPAddr()
-	if addr == "" {
-		return false
+	addrs := i.clusterTCPAddrs()
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		conn, err := i.tcpDialFn(dialCtx, "tcp", addr)
+		cancel()
+		if err == nil {
+			conn.Close() //nolint:errcheck
+			return true
+		}
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	conn, err := i.tcpDialFn(dialCtx, "tcp", addr)
-	if err != nil {
-		return false
+	return false
+}
+
+// clusterTCPAddrs returns TCP addresses to probe for cluster reachability.
+// Peer client addresses (derived from initial-cluster peer URLs, converting port 2380→2379)
+// are tried first so that a corrupted member can detect its live peers.
+// The local etcd endpoint is appended as a final fallback.
+func (i *Initializer) clusterTCPAddrs() []string {
+	var addrs []string
+
+	// Parse initial-cluster: "name1=peerURL1,name2=peerURL2,..."
+	// For each peer that is NOT this member, derive its client address (2380→2379).
+	for _, part := range splitInitialCluster(i.initialCluster) {
+		eqIdx := indexOf(part, '=')
+		if eqIdx < 0 {
+			continue
+		}
+		name := part[:eqIdx]
+		peerURL := part[eqIdx+1:]
+		if name == i.memberName {
+			continue // skip self
+		}
+		// Convert peer port (2380) to client port (2379) for TCP reachability check.
+		addr := urlToTCPAddr(peerURL)
+		addr = strings.Replace(addr, ":2380", ":2379", 1)
+		if addr != "" {
+			addrs = append(addrs, addr)
+		}
 	}
-	conn.Close() //nolint:errcheck
-	return true
+
+	// Append local endpoint as fallback (works for single-node and when self is up).
+	if local := i.etcdTCPAddr(); local != "" {
+		addrs = append(addrs, local)
+	}
+	return addrs
+}
+
+// splitInitialCluster splits an initial-cluster string on commas.
+func splitInitialCluster(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var parts []string
+	start := 0
+	for idx := 0; idx < len(s); idx++ {
+		if s[idx] == ',' {
+			parts = append(parts, s[start:idx])
+			start = idx + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
 }
 
 // etcdTCPAddr extracts the host:port from the etcd endpoint URL.
 func (i *Initializer) etcdTCPAddr() string {
-	ep := i.etcdEndpoint
+	return urlToTCPAddr(i.etcdEndpoint)
+}
+
+// urlToTCPAddr strips scheme and path from a URL and returns host:port.
+func urlToTCPAddr(ep string) string {
 	// Strip scheme prefix.
 	for _, prefix := range []string{"https://", "http://"} {
 		if len(ep) > len(prefix) && ep[:len(prefix)] == prefix {

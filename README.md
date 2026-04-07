@@ -31,8 +31,13 @@ SPDX-License-Identifier: Apache-2.0
 | Users / integrators | [Configuration Reference](docs/usage/configuration.md) |
 | Operators | [Operator Guide](docs/operator/getting-started.md) |
 | Developers | [Developer Guide](docs/development/getting-started.md) |
+| Developers | [Testing Guide](docs/development/testing.md) |
 | Concepts | [Architecture](docs/concepts/architecture.md) |
 | Concepts | [etcd Member Lifecycle](docs/concepts/etcd-member-lifecycle.md) |
+| Concepts | [Component Reference](docs/concepts/components.md) |
+| Concepts | [Snapshot and Backup](docs/concepts/snapshot-backup.md) |
+| Concepts | [Implementation Status](docs/concepts/implementation-status.md) |
+| Concepts | [Roadmap](docs/concepts/roadmap.md) |
 
 ## Quick start
 

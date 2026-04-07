@@ -95,6 +95,17 @@ func main() {
 	fs.String("store-container", "", "snapstore container/bucket")
 	fs.String("storage-provider", "", "snapstore provider (S3, GCS, ABS, Local)")
 	fs.String("store-tempdir", "", "snapstore temp directory")
+	// Snapshot schedule / retention flags (passed by etcd-druid when backup is configured).
+	fs.String("schedule", "", "full snapshot cron schedule")
+	fs.Duration("delta-snapshot-period", 1*time.Minute, "delta snapshot period")
+	fs.Int64("delta-snapshot-memory-limit", 100*1024*1024, "delta snapshot memory limit in bytes")
+	fs.Duration("delta-snapshot-retention-period", 0, "delta snapshot retention period")
+	fs.String("garbage-collection-policy", "Exponential", "snapshot garbage collection policy")
+	fs.Duration("garbage-collection-period", 12*time.Hour, "snapshot garbage collection period")
+	fs.Int64("max-backups", 7, "maximum number of backups (LimitBased GC policy)")
+	fs.Bool("compress-snapshots", false, "enable snapshot compression")
+	fs.String("compression-policy", "gzip", "snapshot compression policy")
+	fs.String("etcd-snapshot-timeout", "10m", "timeout for etcd snapshot operation")
 
 	// Parse args, skipping the "server" subcommand token if present.
 	args := os.Args[1:]

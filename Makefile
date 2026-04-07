@@ -4,7 +4,7 @@ include hack/tools.mk
 
 .PHONY: build
 build:
-	@./hack/build.sh
+	@CGO_ENABLED=0 go build -mod vendor -o $(BIN_DIR)/etcd-steward ./cmd/etcd-steward/
 
 .PHONY: clean
 clean:
@@ -17,7 +17,11 @@ revendor:
 
 .PHONY: check
 check: $(GOLANGCI_LINT)
-	@./hack/check.sh --golangci-lint-config=./.golangci.yaml ./internal/...
+	@./hack/check.sh --golangci-lint-config=./.golangci.yaml ./pkg/... ./cmd/...
+
+.PHONY: test
+test:
+	@go test -count=1 -race ./pkg/... ./cmd/...
 
 .PHONY: add-license-headers
 add-license-headers: $(GO_ADD_LICENSE)

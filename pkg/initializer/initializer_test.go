@@ -209,7 +209,7 @@ func TestInitializer_MultiNode_DataLoss_TriggersRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start TCP listener: %v", err)
 	}
-	defer ln.Close()
+	defer ln.Close() //nolint:errcheck
 	listenAddr := ln.Addr().String()
 
 	rec := &mockRecorder{}

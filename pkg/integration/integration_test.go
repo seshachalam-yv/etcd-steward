@@ -66,7 +66,7 @@ func newTestServer(t *testing.T, init *initializer.Initializer, dataDir string) 
 		t.Fatalf("listen: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	ln.Close() //nolint:errcheck
 
 	logger := zap.NewNop()
 	srv := server.NewServer(
@@ -92,11 +92,11 @@ func newTestServer(t *testing.T, init *initializer.Initializer, dataDir string) 
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(base + "/healthz")
 		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 			break
 		}
 		if resp != nil {
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -141,7 +141,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /healthz: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
 		}
@@ -157,7 +157,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /initialization/status: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		body, _ := io.ReadAll(resp.Body)
 		if string(body) != "New" {
 			t.Errorf("status = %q, want \"New\"", string(body))
@@ -170,7 +170,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /config: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
 		}
@@ -190,7 +190,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("POST /initialization/start: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status = %d, want 200; body: %s", resp.StatusCode, body)
@@ -206,7 +206,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /initialization/status: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		body, _ := io.ReadAll(resp.Body)
 		if string(body) != "Successful" {
 			t.Errorf("status = %q, want \"Successful\"", string(body))
@@ -233,7 +233,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("second POST /initialization/start: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		body, _ := io.ReadAll(resp.Body)
 		if strings.TrimSpace(string(body)) != "Successful" {
 			t.Errorf("idempotent body = %q, want \"Successful\"", string(body))
@@ -246,7 +246,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /metrics: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("status = %d, want 200", resp.StatusCode)
 		}
@@ -265,7 +265,7 @@ func TestHTTPLifecycle_PathC(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DELETE /initialization/start: %v", err)
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Errorf("status = %d, want 405", resp.StatusCode)
 		}
@@ -285,7 +285,7 @@ func TestHTTPLifecycle_PathA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bbolt: %v", err)
 	}
-	db.Close()
+	db.Close() //nolint:errcheck
 
 	init := newInitializer(dataDir)
 	base, cancel := newTestServer(t, init, dataDir)
@@ -300,7 +300,7 @@ func TestHTTPLifecycle_PathA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /initialization/start: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 	body, _ := io.ReadAll(resp.Body)
 	if strings.TrimSpace(string(body)) != "Successful" {
 		t.Errorf("path A start body = %q, want \"Successful\"", string(body))
@@ -323,7 +323,7 @@ func TestServerReachableBeforeInit(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	ln.Close() //nolint:errcheck
 
 	status := initializer.InitializationStatusNew
 	srv := server.NewServer(
@@ -344,7 +344,7 @@ func TestServerReachableBeforeInit(t *testing.T) {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(base + "/healthz")
 		if err == nil {
-			resp.Body.Close()
+			resp.Body.Close() //nolint:errcheck
 			if resp.StatusCode == http.StatusOK {
 				return // PASS — server was reachable before init
 			}

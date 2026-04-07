@@ -372,7 +372,7 @@ func (i *Initializer) isEtcdReachable(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	conn.Close() //nolint:errcheck
 	return true
 }
 

@@ -40,6 +40,23 @@ type UpdateStatusOpts struct {
 	ClusterID *string
 	// LastTransition is the last state transition to record (optional).
 	LastTransition *statemachine.Transition
+	// LastRestoration carries the outcome of the most recent restoration operation (optional).
+	// When set, the EtcdMember.status.lastRestoration field is updated.
+	LastRestoration *LastRestorationStatus
+}
+
+// LastRestorationStatus is the status of a completed restoration operation written to EtcdMember.status.
+type LastRestorationStatus struct {
+	// Type is "FromSnapshot" or "FromLeader".
+	Type string
+	// Status is "Succeeded", "Failed", or "InProgress".
+	Status string
+	// StartTime is when the restoration began.
+	StartTime metav1.Time
+	// EndTime is when the restoration completed (nil if still in progress).
+	EndTime *metav1.Time
+	// Message is an optional human-readable result message.
+	Message *string
 }
 
 // Client provides operations on EtcdMember resources.
@@ -73,6 +90,20 @@ func (c *K8sMemberClient) UpdateStatus(ctx context.Context, memberName, namespac
 	}
 	if opts.LastTransition != nil {
 		statusFields["lastTransition"] = opts.LastTransition
+	}
+	if opts.LastRestoration != nil {
+		r := map[string]interface{}{
+			"type":      opts.LastRestoration.Type,
+			"status":    opts.LastRestoration.Status,
+			"startTime": opts.LastRestoration.StartTime,
+		}
+		if opts.LastRestoration.EndTime != nil {
+			r["endTime"] = opts.LastRestoration.EndTime
+		}
+		if opts.LastRestoration.Message != nil {
+			r["message"] = *opts.LastRestoration.Message
+		}
+		statusFields["lastRestoration"] = r
 	}
 
 	payload := map[string]interface{}{

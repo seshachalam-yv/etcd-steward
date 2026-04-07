@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gardener/etcd-steward/pkg/compression"
 	"github.com/gardener/etcd-steward/pkg/etcdclient"
@@ -170,6 +171,21 @@ func (i *Initializer) Start(ctx context.Context, mode string) error {
 func (i *Initializer) run(ctx context.Context, mode string) {
 	start := time.Now()
 	path := "unknown"
+
+	// Record the initial New state per DEP-04. This is the very first transition for this member
+	// and allows etcd-druid to distinguish a never-initialised member from one in progress.
+	newReason := statemachine.ReasonNewSingleNodeClusterCreated
+	if !i.isSingleNode {
+		newReason = statemachine.ReasonClusterScaledUp
+	}
+	if err := i.record(ctx, statemachine.Transition{
+		State:  statemachine.StateNew,
+		Reason: newReason,
+	}); err != nil {
+		// Non-fatal: if EtcdMember doesn't exist yet (race with etcd-druid), log and continue.
+		i.logger.Warn("failed to record initial New transition, continuing", zap.Error(err))
+	}
+
 	err := i.initialize(ctx, mode)
 	duration := time.Since(start).Seconds()
 	metrics.InitializationDurationSeconds.WithLabelValues(i.memberNamespace, i.memberName, path).Observe(duration)
@@ -281,8 +297,31 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 			return fmt.Errorf("failed to record restoration transition: %w", err)
 		}
 
+		restoreStart := metav1.Now()
 		if err := i.tryRestore(ctx); err != nil {
+			restoreEnd := metav1.Now()
+			msg := err.Error()
+			_ = i.memberClient.UpdateStatus(ctx, i.memberName, i.memberNamespace, member.UpdateStatusOpts{
+				LastRestoration: &member.LastRestorationStatus{
+					Type:      "FromSnapshot",
+					Status:    "Failed",
+					StartTime: restoreStart,
+					EndTime:   &restoreEnd,
+					Message:   &msg,
+				},
+			})
 			return fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
+		}
+		restoreEnd := metav1.Now()
+		if err := i.memberClient.UpdateStatus(ctx, i.memberName, i.memberNamespace, member.UpdateStatusOpts{
+			LastRestoration: &member.LastRestorationStatus{
+				Type:      "FromSnapshot",
+				Status:    "Succeeded",
+				StartTime: restoreStart,
+				EndTime:   &restoreEnd,
+			},
+		}); err != nil {
+			i.logger.Warn("failed to update LastRestoration status after successful restore", zap.Error(err))
 		}
 
 		leaderSubState := statemachine.SubStateLeader
@@ -297,7 +336,31 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 	}
 
 	// Multi-node: DB validation failed.
-	return fmt.Errorf("DB validation failed for multi-node member %s: %v", i.memberName, result.Err)
+	// Per DEP-04: record New state, remove data directory, remove this member from the cluster,
+	// then re-join as a learner. This avoids an infinite restart loop where the member repeatedly
+	// fails validation with the same corrupted DB.
+	i.logger.Warn("DB validation failed for multi-node member, re-joining cluster as learner",
+		zap.String("member", i.memberName),
+		zap.Error(result.Err),
+	)
+	if err := i.record(ctx, statemachine.Transition{
+		State:   statemachine.StateNew,
+		Reason:  statemachine.ReasonDBValidationFailed,
+		Message: fmt.Sprintf("DB validation failed, re-joining as learner: %v", result.Err),
+	}); err != nil {
+		return fmt.Errorf("failed to record New transition after DB validation failure: %w", err)
+	}
+	if err := os.RemoveAll(i.dataDir); err != nil {
+		return fmt.Errorf("failed to remove data directory after DB validation failure for %s: %w", i.memberName, err)
+	}
+	if err := i.clusterClient.RemoveStaleMember(ctx, i.peerURL); err != nil {
+		// Log but do not fatal — the member may not be registered yet (e.g. first startup).
+		i.logger.Warn("failed to remove stale member entry before re-joining, proceeding anyway",
+			zap.String("peerURL", i.peerURL),
+			zap.Error(err),
+		)
+	}
+	return i.joinAsLearner(ctx)
 }
 
 // isDataDirEmpty returns true if the etcd data directory contains no DB or WAL files.
@@ -468,6 +531,16 @@ func indexOf(s string, b byte) int {
 func (i *Initializer) initializeDataLossRecovery(ctx context.Context) error {
 	i.inDataLossRecovery.Store(true)
 
+	// Record New state with DataLossRecoveryStarted reason so etcd-druid can distinguish
+	// a data-loss re-join from a normal scale-up in the transition history.
+	if err := i.record(ctx, statemachine.Transition{
+		State:   statemachine.StateNew,
+		Reason:  statemachine.ReasonDataLossRecoveryStarted,
+		Message: "data-loss detected: removing stale member entry and re-joining as learner",
+	}); err != nil {
+		return fmt.Errorf("failed to record data-loss recovery transition: %w", err)
+	}
+
 	i.logger.Info("removing stale member entry before rejoining as learner",
 		zap.String("peerURL", i.peerURL),
 	)
@@ -480,6 +553,18 @@ func (i *Initializer) initializeDataLossRecovery(ctx context.Context) error {
 
 // initializeAsLearner handles Path B: new member joining as learner (scale-up).
 func (i *Initializer) initializeAsLearner(ctx context.Context) error {
+	// DEP-04: record Initializing state before any cluster interaction so etcd-druid
+	// can track the full transition sequence for scale-up members.
+	initSubState := statemachine.SubStateDBValidationSanity
+	if err := i.record(ctx, statemachine.Transition{
+		State:    statemachine.StateInitializing,
+		SubState: &initSubState,
+		Reason:   statemachine.ReasonClusterScaledUp,
+		Message:  "new member added via scale-up, proceeding to join as learner",
+	}); err != nil {
+		return fmt.Errorf("failed to record Initializing transition for scale-up: %w", err)
+	}
+
 	// Check if we're already a learner.
 	alreadyJoined, existingMemberID, err := i.findExistingLearnerMember(ctx)
 	if err != nil {

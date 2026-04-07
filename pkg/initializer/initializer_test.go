@@ -115,19 +115,27 @@ func TestInitializer_SingleNode_HappyPath(t *testing.T) {
 		}
 	}
 
-	// Verify transitions.
-	if len(rec.transitions) < 2 {
-		t.Fatalf("expected at least 2 transitions, got %d", len(rec.transitions))
+	// Verify transitions: New → Initializing/DBValidationSanity → Started/Leader
+	if len(rec.transitions) < 3 {
+		t.Fatalf("expected at least 3 transitions, got %d: %v", len(rec.transitions), rec.transitions)
 	}
 
-	// First transition: Initializing/DBValidationSanity.
-	if rec.transitions[0].State != statemachine.StateInitializing {
-		t.Errorf("transition[0].State = %s, want Initializing", rec.transitions[0].State)
+	// First transition: New (initial state recording).
+	if rec.transitions[0].State != statemachine.StateNew {
+		t.Errorf("transition[0].State = %s, want New", rec.transitions[0].State)
+	}
+	if rec.transitions[0].Reason != statemachine.ReasonNewSingleNodeClusterCreated {
+		t.Errorf("transition[0].Reason = %s, want NewSingleNodeClusterCreated", rec.transitions[0].Reason)
 	}
 
-	// Second transition: Started/Leader.
-	if rec.transitions[1].State != statemachine.StateStarted {
-		t.Errorf("transition[1].State = %s, want Started", rec.transitions[1].State)
+	// Second transition: Initializing/DBValidationSanity.
+	if rec.transitions[1].State != statemachine.StateInitializing {
+		t.Errorf("transition[1].State = %s, want Initializing", rec.transitions[1].State)
+	}
+
+	// Third transition: Started/Leader.
+	if rec.transitions[2].State != statemachine.StateStarted {
+		t.Errorf("transition[2].State = %s, want Started", rec.transitions[2].State)
 	}
 }
 
@@ -179,9 +187,17 @@ func TestInitializer_LearnerJoin_HappyPath(t *testing.T) {
 		t.Error("expected IsLearner() to be true after learner join")
 	}
 
-	// Verify transitions include PendingLearner and Learner.
-	if len(rec.transitions) < 2 {
-		t.Fatalf("expected at least 2 transitions, got %d", len(rec.transitions))
+	// Verify transitions: New → Initializing → PendingLearner → Learner → (Follower async)
+	// Use presence-based checks since promotion is async and may or may not have fired yet.
+	if len(rec.transitions) < 4 {
+		t.Fatalf("expected at least 4 transitions, got %d: %v", len(rec.transitions), rec.transitions)
+	}
+	// First two transitions: New and Initializing (both synchronous before learner join).
+	if rec.transitions[0].State != statemachine.StateNew {
+		t.Errorf("transition[0].State = %s, want New", rec.transitions[0].State)
+	}
+	if rec.transitions[1].State != statemachine.StateInitializing {
+		t.Errorf("transition[1].State = %s, want Initializing", rec.transitions[1].State)
 	}
 	foundPending := false
 	foundLearner := false

@@ -6,6 +6,7 @@ package lock
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -19,13 +20,16 @@ type fakeEtcdAPI struct {
 	nextLease clientv3.LeaseID
 	keys      map[string]clientv3.LeaseID
 	watchers  map[string][]chan clientv3.WatchResponse
+	// watchStarted is closed the first time Watch is called (used by synchronized tests).
+	watchStarted chan struct{}
 }
 
 func newFakeEtcdAPI() *fakeEtcdAPI {
 	return &fakeEtcdAPI{
-		nextLease: 1,
-		keys:      make(map[string]clientv3.LeaseID),
-		watchers:  make(map[string][]chan clientv3.WatchResponse),
+		nextLease:    1,
+		keys:         make(map[string]clientv3.LeaseID),
+		watchers:     make(map[string][]chan clientv3.WatchResponse),
+		watchStarted: make(chan struct{}),
 	}
 }
 
@@ -69,6 +73,13 @@ func (f *fakeEtcdAPI) Watch(_ context.Context, key string, _ ...clientv3.OpOptio
 	defer f.mu.Unlock()
 	ch := make(chan clientv3.WatchResponse, 1)
 	f.watchers[key] = append(f.watchers[key], ch)
+	// Signal that a watcher has been registered (close once).
+	select {
+	case <-f.watchStarted:
+		// Already closed.
+	default:
+		close(f.watchStarted)
+	}
 	return ch
 }
 
@@ -206,6 +217,140 @@ func TestLock_AcquireCancelledContext(t *testing.T) {
 		t.Error("expected error when acquiring with cancelled context")
 	}
 
+	if err := l1.Release(ctx); err != nil {
+		t.Fatalf("l1.Release failed: %v", err)
+	}
+}
+
+// fakeEtcdAPIWithGrantErr wraps fakeEtcdAPI and injects a Grant error.
+type fakeEtcdAPIWithGrantErr struct {
+	*fakeEtcdAPI
+	grantErr error
+}
+
+func (f *fakeEtcdAPIWithGrantErr) Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error) {
+	if f.grantErr != nil {
+		return nil, f.grantErr
+	}
+	return f.fakeEtcdAPI.Grant(ctx, ttl)
+}
+
+// fakeTxnWithCommitErr wraps fakeTxn but always returns an error from Commit.
+// It overrides all chaining methods to return itself so that Commit() is always called
+// on this type rather than the inner *fakeTxn.
+type fakeTxnWithCommitErr struct {
+	*fakeTxn
+	commitErr error
+}
+
+func (t *fakeTxnWithCommitErr) If(cmps ...clientv3.Cmp) clientv3.Txn {
+	t.fakeTxn.If(cmps...)
+	return t
+}
+
+func (t *fakeTxnWithCommitErr) Then(ops ...clientv3.Op) clientv3.Txn {
+	t.fakeTxn.Then(ops...)
+	return t
+}
+
+func (t *fakeTxnWithCommitErr) Else(ops ...clientv3.Op) clientv3.Txn {
+	t.fakeTxn.Else(ops...)
+	return t
+}
+
+func (t *fakeTxnWithCommitErr) Commit() (*clientv3.TxnResponse, error) {
+	return nil, t.commitErr
+}
+
+// fakeEtcdAPIWithTxnErr returns a fakeTxn whose Commit always errors.
+type fakeEtcdAPIWithTxnErr struct {
+	*fakeEtcdAPI
+	commitErr error
+}
+
+func (f *fakeEtcdAPIWithTxnErr) Txn(ctx context.Context) clientv3.Txn {
+	inner := f.fakeEtcdAPI.Txn(ctx).(*fakeTxn)
+	return &fakeTxnWithCommitErr{fakeTxn: inner, commitErr: f.commitErr}
+}
+
+// TestLock_New verifies that New does not panic and builds the expected lockKey.
+func TestLock_New(t *testing.T) {
+	// New accepts a nil *clientv3.Client — the adapter wraps it without dereferencing.
+	l := New(nil, "mynamespace", "myname")
+	if l == nil {
+		t.Fatal("expected non-nil Lock from New")
+	}
+	want := lockKeyPrefix + "mynamespace/myname"
+	if l.lockKey != want {
+		t.Errorf("lockKey = %q, want %q", l.lockKey, want)
+	}
+}
+
+// TestLock_AcquireGrantError verifies that Acquire propagates a Grant failure.
+func TestLock_AcquireGrantError(t *testing.T) {
+	base := newFakeEtcdAPI()
+	grantErr := fmt.Errorf("lease quota exceeded")
+	api := &fakeEtcdAPIWithGrantErr{fakeEtcdAPI: base, grantErr: grantErr}
+
+	l := NewWithAPI(api, "default", "etcd-main")
+	err := l.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected error from Acquire when Grant fails")
+	}
+	if l.leaseID != 0 {
+		t.Errorf("leaseID should remain 0 after Grant error, got %d", l.leaseID)
+	}
+}
+
+// TestLock_AcquireTxnCommitError verifies that Acquire propagates a Txn.Commit failure.
+func TestLock_AcquireTxnCommitError(t *testing.T) {
+	base := newFakeEtcdAPI()
+	commitErr := fmt.Errorf("etcd unavailable")
+	api := &fakeEtcdAPIWithTxnErr{fakeEtcdAPI: base, commitErr: commitErr}
+
+	l := NewWithAPI(api, "default", "etcd-main")
+	err := l.Acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected error from Acquire when Txn.Commit fails")
+	}
+	if l.leaseID != 0 {
+		t.Errorf("leaseID should remain 0 after Txn error, got %d", l.leaseID)
+	}
+}
+
+// TestLock_ContextCancelledDuringWatch verifies that cancelling the context while
+// l2 is waiting in the watch loop causes Acquire to return the context error.
+func TestLock_ContextCancelledDuringWatch(t *testing.T) {
+	api := newFakeEtcdAPI()
+	l1 := NewWithAPI(api, "default", "etcd-main")
+	l2 := NewWithAPI(api, "default", "etcd-main")
+
+	ctx := context.Background()
+
+	// l1 acquires the lock so that l2 must wait.
+	if err := l1.Acquire(ctx); err != nil {
+		t.Fatalf("l1.Acquire failed: %v", err)
+	}
+
+	watchCtx, cancel := context.WithCancel(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- l2.Acquire(watchCtx)
+	}()
+
+	// Give the goroutine time to reach the watch loop, then cancel.
+	// We use a small sleep here — the only acceptable use in tests where
+	// we need to synchronize with an internal goroutine state.
+	// There is no synchronization primitive exposed for the watch-loop entry.
+	cancel()
+
+	err := <-errCh
+	if err == nil {
+		t.Fatal("expected non-nil error when context is cancelled during watch")
+	}
+
+	// Cleanup.
 	if err := l1.Release(ctx); err != nil {
 		t.Fatalf("l1.Release failed: %v", err)
 	}

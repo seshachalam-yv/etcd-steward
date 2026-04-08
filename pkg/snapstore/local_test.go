@@ -143,6 +143,20 @@ func TestParseSnapshotName_Valid(t *testing.T) {
 			wantStart: 100,
 			wantLast:  200,
 		},
+		{
+			name:      "full snapshot with zstd extension",
+			input:     "Full-0000000000000000-0000000000000004-1775676838670629376.zst",
+			wantKind:  "Full",
+			wantStart: 0,
+			wantLast:  4,
+		},
+		{
+			name:      "incremental snapshot with gzip extension",
+			input:     "Incremental-0000000000000004-0000000000000010-1775676900000000000.gz",
+			wantKind:  "Incremental",
+			wantStart: 4,
+			wantLast:  10,
+		},
 	}
 
 	for _, tc := range tests {
@@ -225,6 +239,46 @@ func TestLocalSnapstore_TmpFilesSkippedInList(t *testing.T) {
 		t.Errorf("expected 1 snapshot (tmp skipped), got %d", len(list))
 	}
 }
+
+func TestLocalSnapstore_List_CompressedFilenames(t *testing.T) {
+	// Verify that List() correctly parses snapshot files that have compression extensions
+	// (e.g. .zst, .gz) appended to the snapshot name by the snapshotter.
+	baseDir := t.TempDir()
+	store := NewLocal(baseDir)
+
+	// Simulate a .zst-compressed snapshot written by the snapshotter.
+	zstSnap := makeSnap("Full", 0, 100, "Backup-v1")
+	zstSnap.SnapName = zstSnap.SnapName + ".zst"
+	if err := store.Save(zstSnap, io.NopCloser(bytes.NewReader([]byte("compressed-data")))); err != nil {
+		t.Fatalf("Save error: %v", err)
+	}
+
+	// Simulate a .gz-compressed incremental snapshot.
+	gzSnap := makeSnap("Incremental", 100, 200, "Backup-v1")
+	gzSnap.SnapName = gzSnap.SnapName + ".gz"
+	if err := store.Save(gzSnap, io.NopCloser(bytes.NewReader([]byte("gz-data")))); err != nil {
+		t.Fatalf("Save error: %v", err)
+	}
+
+	list, err := store.List()
+	if err != nil {
+		t.Fatalf("List error: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 snapshots, got %d", len(list))
+	}
+
+	if list[0].Kind != "Full" {
+		t.Errorf("list[0].Kind = %q, want Full", list[0].Kind)
+	}
+	if list[0].LastRevision != 100 {
+		t.Errorf("list[0].LastRevision = %d, want 100", list[0].LastRevision)
+	}
+	if list[1].Kind != "Incremental" {
+		t.Errorf("list[1].Kind = %q, want Incremental", list[1].Kind)
+	}
+}
+
 
 func TestNewSnapstore_Local(t *testing.T) {
 	baseDir := t.TempDir()

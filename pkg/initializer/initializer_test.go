@@ -5,6 +5,7 @@
 package initializer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/gardener/etcd-steward/pkg/compression"
 	"github.com/gardener/etcd-steward/pkg/etcdclient"
 	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
@@ -587,12 +589,18 @@ func TestInitializerStart_Idempotent(t *testing.T) {
 
 // mockSnapstore is a minimal Snapstore implementation for testing tryRestore.
 type mockSnapstore struct {
-	snaps   []snapstore.Snapshot
-	listErr error
+	snaps    []snapstore.Snapshot
+	listErr  error
+	snapData map[string][]byte // path -> raw bytes, used by Fetch
 }
 
 func (m *mockSnapstore) Save(_ snapstore.Snapshot, _ io.ReadCloser) error { return nil }
-func (m *mockSnapstore) Fetch(_ snapstore.Snapshot) (io.ReadCloser, error) {
+func (m *mockSnapstore) Fetch(s snapstore.Snapshot) (io.ReadCloser, error) {
+	if m.snapData != nil {
+		if data, ok := m.snapData[s.Path()]; ok {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+	}
 	return nil, fmt.Errorf("fetch not implemented in mock")
 }
 func (m *mockSnapstore) List() ([]snapstore.Snapshot, error) {
@@ -756,5 +764,158 @@ func TestPromoteLearner_AllAttemptsFail_ContextCancelledDuringBackoff(t *testing
 	// The function should return ctx.Err().
 	if err == nil {
 		t.Fatal("expected error from promoteLearner")
+	}
+}
+
+// TestInitializer_SingleNode_EmptyDataDir_WithSnapshots verifies the PVC-deletion restoration path:
+// when the data directory is empty (e.g. PVC was deleted and re-provisioned) and a snapstore
+// is configured with existing snapshots, the initializer must restore from those snapshots
+// instead of bootstrapping a fresh empty cluster.
+func TestInitializer_SingleNode_EmptyDataDir_WithSnapshots(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Simulate a snapshot in the store: minimal valid content (restoration.Restore
+	// will write it to dataDir/member/snap/db).
+	fakeDBContent := []byte("fake-etcd-db-content")
+	fullSnap := snapstore.Snapshot{
+		Kind:          "Full",
+		StartRevision: 0,
+		LastRevision:  42,
+		CreatedOn:     time.Now(),
+		SnapDir:       "Backup-1",
+		SnapName:      "Full-0000000000000000-0000000000000042-12345678",
+	}
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{fullSnap},
+		snapData: map[string][]byte{
+			fullSnap.Path(): fakeDBContent,
+		},
+	}
+
+	comp, err := compression.NewCompressor("none")
+	if err != nil {
+		t.Fatalf("failed to create compressor: %v", err)
+	}
+
+	rec := &mockRecorder{}
+	init := New(
+		"etcd-main-0", "default",
+		"https://etcd-main-0:2380",
+		dataDir, "",
+		"etcd-main-0=https://etcd-main-0:2380",
+		true,  // singleNode
+		false, // no learner annotation
+		rec,
+		&member.NoopClient{},
+		&mockClusterClient{},
+		nil,
+		"http://localhost:2379",
+		zap.NewNop(),
+		store, comp,
+	)
+
+	// Data dir must be empty at start (simulates PVC deletion).
+	if !init.isDataDirEmpty() {
+		t.Fatal("precondition failed: data dir should be empty")
+	}
+
+	ctx := context.Background()
+	if err := init.Start(ctx, "full"); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for init.GetStatus() != InitializationStatusSuccessful {
+		select {
+		case <-deadline:
+			t.Fatalf("initialization did not complete, status: %s", init.GetStatus())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// After restoration, the DB file must exist.
+	dbPath := filepath.Join(dataDir, "member", "snap", "db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		t.Fatal("expected DB file to exist after restoration, but it does not")
+	}
+
+	// Verify the Restoration transition was recorded.
+	foundRestoration := false
+	foundRestorationSucceeded := false
+	for _, tr := range rec.transitions {
+		if tr.SubState != nil && *tr.SubState == statemachine.SubStateRestoration {
+			foundRestoration = true
+		}
+		if tr.State == statemachine.StateStarted && tr.Reason == statemachine.ReasonRestorationSucceeded {
+			foundRestorationSucceeded = true
+		}
+	}
+	if !foundRestoration {
+		t.Error("expected Restoration transition to be recorded")
+	}
+	if !foundRestorationSucceeded {
+		t.Error("expected RestorationSucceeded transition to be recorded")
+	}
+}
+
+// TestInitializer_SingleNode_EmptyDataDir_NoSnapshots verifies that when the data directory
+// is empty and no snapshots exist in the store (genuinely fresh cluster), initialization
+// proceeds as a normal fresh start without errors — not treated as a restoration failure.
+func TestInitializer_SingleNode_EmptyDataDir_NoSnapshots(t *testing.T) {
+	dataDir := t.TempDir()
+
+	store := &mockSnapstore{snaps: nil}
+	comp, err := compression.NewCompressor("none")
+	if err != nil {
+		t.Fatalf("failed to create compressor: %v", err)
+	}
+
+	rec := &mockRecorder{}
+	init := New(
+		"etcd-main-0", "default",
+		"https://etcd-main-0:2380",
+		dataDir, "",
+		"etcd-main-0=https://etcd-main-0:2380",
+		true, false,
+		rec,
+		&member.NoopClient{},
+		&mockClusterClient{},
+		nil, "http://localhost:2379",
+		zap.NewNop(),
+		store, comp,
+	)
+
+	ctx := context.Background()
+	if err := init.Start(ctx, "full"); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for init.GetStatus() != InitializationStatusSuccessful {
+		select {
+		case <-deadline:
+			t.Fatalf("initialization did not complete, status: %s", init.GetStatus())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Fresh start: no DB file should be created by restoration.
+	dbPath := filepath.Join(dataDir, "member", "snap", "db")
+	if _, err := os.Stat(dbPath); err == nil {
+		t.Error("expected no DB file for fresh cluster (no snapshots), but file exists")
+	}
+
+	// Should record NewSingleNodeClusterCreated (not RestorationSucceeded).
+	foundNew := false
+	for _, tr := range rec.transitions {
+		if tr.Reason == statemachine.ReasonNewSingleNodeClusterCreated {
+			foundNew = true
+		}
+	}
+	if !foundNew {
+		t.Error("expected NewSingleNodeClusterCreated transition for fresh cluster")
 	}
 }

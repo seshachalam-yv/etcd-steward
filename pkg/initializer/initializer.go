@@ -250,6 +250,65 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 
 	result := validator.Validate(i.dataDir, valMode)
 	if result.Valid {
+		// Single-node: if the data directory is empty and a snapstore is configured,
+		// attempt restoration from the latest snapshot before proceeding. This handles
+		// the PVC-deletion scenario where etcd would otherwise bootstrap fresh and lose
+		// all data. tryRestore is a no-op when no snapshots are found (ErrNoSnapshotFound),
+		// so a genuinely fresh cluster is handled identically to the no-store case.
+		if i.isSingleNode && i.isDataDirEmpty() && i.store != nil {
+			restorationSubState := statemachine.SubStateRestoration
+			if err := i.record(ctx, statemachine.Transition{
+				State:    statemachine.StateInitializing,
+				SubState: &restorationSubState,
+				Reason:   statemachine.ReasonDBValidationFailed,
+			}); err != nil {
+				return fmt.Errorf("failed to record restoration transition: %w", err)
+			}
+
+			restoreStart := metav1.Now()
+			if err := i.tryRestore(ctx); err != nil {
+				restoreEnd := metav1.Now()
+				msg := err.Error()
+				_ = i.memberClient.UpdateStatus(ctx, i.memberName, i.memberNamespace, member.UpdateStatusOpts{
+					LastRestoration: &member.LastRestorationStatus{
+						Type:      "FromSnapshot",
+						Status:    "Failed",
+						StartTime: restoreStart,
+						EndTime:   &restoreEnd,
+						Message:   &msg,
+					},
+				})
+				return fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
+			}
+			restoreEnd := metav1.Now()
+			// Only update LastRestoration status if there were actual snapshots to restore from.
+			// tryRestore returns nil for both "no snapshots" (fresh cluster) and "restore succeeded".
+			// We check the data dir: if restoration populated it, snapshots were found.
+			if !i.isDataDirEmpty() {
+				if err := i.memberClient.UpdateStatus(ctx, i.memberName, i.memberNamespace, member.UpdateStatusOpts{
+					LastRestoration: &member.LastRestorationStatus{
+						Type:      "FromSnapshot",
+						Status:    "Succeeded",
+						StartTime: restoreStart,
+						EndTime:   &restoreEnd,
+					},
+				}); err != nil {
+					i.logger.Warn("failed to update LastRestoration status after successful restore", zap.Error(err))
+				}
+
+				leaderSubState := statemachine.SubStateLeader
+				if err := i.record(ctx, statemachine.Transition{
+					State:    statemachine.StateStarted,
+					SubState: &leaderSubState,
+					Reason:   statemachine.ReasonRestorationSucceeded,
+				}); err != nil {
+					return fmt.Errorf("failed to record restoration success transition: %w", err)
+				}
+				return nil
+			}
+			// No snapshots found — fall through to fresh start (same as no-store case).
+		}
+
 		// Multi-node: check for data-loss recovery.
 		if !i.isSingleNode {
 			needsRecovery, err := i.needsDataLossRecovery(ctx)

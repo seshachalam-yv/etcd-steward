@@ -77,9 +77,18 @@ func FormatSnapshotName(snap Snapshot) string {
 }
 
 // ParseSnapshotName parses a snapshot filename into a Snapshot struct.
-// The expected format is: {Kind}-{StartRevision:016d}-{LastRevision:016d}-{UnixNano}
+// The expected format is: {Kind}-{StartRevision:016d}-{LastRevision:016d}-{UnixNano}[.ext]
 // Kind must be "Full" or "Incremental".
+// An optional compression extension (.gz, .zst, .lz4) is stripped before parsing.
 func ParseSnapshotName(name string) (Snapshot, error) {
+	// Strip known compression extensions.
+	for _, ext := range []string{".zst", ".gz", ".lz4", ".zlib", ".snappy"} {
+		if strings.HasSuffix(name, ext) {
+			name = name[:len(name)-len(ext)]
+			break
+		}
+	}
+
 	parts := strings.SplitN(name, "-", 4)
 	if len(parts) != 4 {
 		return Snapshot{}, fmt.Errorf("unexpected snapshot filename format: %q", name)

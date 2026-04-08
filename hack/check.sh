@@ -8,11 +8,13 @@
 set -e
 
 GOLANGCI_LINT_CONFIG_FILE=""
+GOLANGCI_LINT_CONFIG_PATH=""
 
 for arg in "$@"; do
   case $arg in
     --golangci-lint-config=*)
-    GOLANGCI_LINT_CONFIG_FILE="-c ${arg#*=}"
+    GOLANGCI_LINT_CONFIG_PATH="${arg#*=}"
+    GOLANGCI_LINT_CONFIG_FILE="-c"
     shift
     ;;
   esac
@@ -21,4 +23,4 @@ done
 echo "> Check"
 
 echo "Executing golangci-lint"
-golangci-lint run "${GOLANGCI_LINT_CONFIG_FILE}" --timeout 10m "$@"
+golangci-lint run ${GOLANGCI_LINT_CONFIG_FILE} ${GOLANGCI_LINT_CONFIG_PATH} --timeout 10m "$@"

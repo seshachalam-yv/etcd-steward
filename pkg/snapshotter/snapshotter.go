@@ -28,6 +28,10 @@ import (
 // ErrNotLeader is returned when a snapshot is attempted on a non-leader member.
 var ErrNotLeader = errors.New("not leader, skipping snapshot")
 
+// ErrNoFullSnapshot is returned when a delta snapshot is attempted before the first full snapshot.
+// This is an expected startup condition and should not be treated as an error.
+var ErrNoFullSnapshot = errors.New("no full snapshot taken yet, cannot take delta")
+
 // EtcdSnapshotAPI is the subset of the etcd maintenance interface for snapshots.
 type EtcdSnapshotAPI interface {
 	Snapshot(ctx context.Context) (io.ReadCloser, error)
@@ -197,7 +201,7 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	s.mu.Unlock()
 
 	if startRev == 0 {
-		return nil, fmt.Errorf("no full snapshot taken yet, cannot take delta")
+		return nil, ErrNoFullSnapshot
 	}
 
 	// Watch from startRev+1 to collect events.
@@ -337,8 +341,16 @@ func (s *Snapshotter) RunDeltaSnapshotLoop(ctx context.Context, period time.Dura
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := s.TriggerDeltaSnapshot(ctx); err != nil && !errors.Is(err, ErrNotLeader) {
-				s.logger.Error("delta snapshot failed", zap.Error(err))
+			if _, err := s.TriggerDeltaSnapshot(ctx); err != nil {
+				switch {
+				case errors.Is(err, ErrNotLeader):
+					// Not the leader — expected on follower pods, skip silently.
+				case errors.Is(err, ErrNoFullSnapshot):
+					// First full snapshot not yet taken — normal at startup, no action needed.
+					s.logger.Debug("skipping delta snapshot, waiting for first full snapshot")
+				default:
+					s.logger.Error("delta snapshot failed", zap.Error(err))
+				}
 			}
 		}
 	}

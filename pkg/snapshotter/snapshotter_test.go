@@ -233,8 +233,8 @@ func TestTriggerDeltaSnapshot_NoFullSnapshotYet(t *testing.T) {
 	// lastRevision is 0 (no full snapshot taken).
 
 	_, err := s.TriggerDeltaSnapshot(context.Background())
-	if err == nil {
-		t.Fatal("expected error when no full snapshot taken, got nil")
+	if !errors.Is(err, ErrNoFullSnapshot) {
+		t.Fatalf("expected ErrNoFullSnapshot, got: %v", err)
 	}
 }
 

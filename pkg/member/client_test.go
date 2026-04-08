@@ -352,6 +352,51 @@ func TestUpdateStatus_WithLastTransition(t *testing.T) {
 	}
 }
 
+func TestUpdateStatus_PeerTLSEnabled_True(t *testing.T) {
+	client, rc := newMockClient()
+
+	enabled := true
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{
+		PeerTLSEnabled: &enabled,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+
+	statusMap := patch["status"].(map[string]interface{})
+	val, has := statusMap["peerTLSEnabled"]
+	if !has {
+		t.Fatal("expected peerTLSEnabled in patch status")
+	}
+	if val != true {
+		t.Errorf("expected peerTLSEnabled=true, got %v", val)
+	}
+}
+
+func TestUpdateStatus_PeerTLSEnabled_Nil(t *testing.T) {
+	client, rc := newMockClient()
+
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+
+	statusMap := patch["status"].(map[string]interface{})
+	if _, has := statusMap["peerTLSEnabled"]; has {
+		t.Error("peerTLSEnabled should be absent when nil")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		func() bool {

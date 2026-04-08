@@ -32,6 +32,12 @@ var etcdMemberGVR = schema.GroupVersionResource{
 	Resource: "etcdmembers",
 }
 
+// EtcdMemberGVR returns the GroupVersionResource for EtcdMember objects.
+// Exported so test packages can create fake dynamic clients with the correct GVR.
+func EtcdMemberGVR() schema.GroupVersionResource {
+	return etcdMemberGVR
+}
+
 // UpdateStatusOpts holds the fields to update in EtcdMember.status.
 type UpdateStatusOpts struct {
 	// MemberID is the etcd member ID (optional).
@@ -43,6 +49,9 @@ type UpdateStatusOpts struct {
 	// LastRestoration carries the outcome of the most recent restoration operation (optional).
 	// When set, the EtcdMember.status.lastRestoration field is updated.
 	LastRestoration *LastRestorationStatus
+	// PeerTLSEnabled indicates whether peer TLS is enabled for this member (optional).
+	// Set once at startup based on the etcd configuration.
+	PeerTLSEnabled *bool
 }
 
 // LastRestorationStatus is the status of a completed restoration operation written to EtcdMember.status.
@@ -65,6 +74,13 @@ type Client interface {
 	UpdateStatus(ctx context.Context, memberName, namespace string, opts UpdateStatusOpts) error
 	// RemoveCreateAsLearnerAnnotation removes the create-as-learner annotation from an EtcdMember.
 	RemoveCreateAsLearnerAnnotation(ctx context.Context, memberName, namespace string) error
+	// PatchStatus applies a raw JSON patch to the EtcdMember status subresource.
+	// The patchType must be types.MergePatchType or types.StrategicMergePatchType.
+	// Used by StatusReconciler to batch-patch multiple status fields.
+	PatchStatus(ctx context.Context, memberName, namespace string, patchType types.PatchType, data []byte) error
+	// SetCondition creates or updates a condition in EtcdMember.status.conditions.
+	// If the condition type already exists with the same status, lastTransitionTime is preserved.
+	SetCondition(ctx context.Context, memberName, namespace string, condition Condition) error
 }
 
 // K8sMemberClient implements Client using the Kubernetes dynamic client.
@@ -104,6 +120,9 @@ func (c *K8sMemberClient) UpdateStatus(ctx context.Context, memberName, namespac
 			r["message"] = *opts.LastRestoration.Message
 		}
 		statusFields["lastRestoration"] = r
+	}
+	if opts.PeerTLSEnabled != nil {
+		statusFields["peerTLSEnabled"] = *opts.PeerTLSEnabled
 	}
 
 	payload := map[string]interface{}{
@@ -158,6 +177,22 @@ func (c *K8sMemberClient) RemoveCreateAsLearnerAnnotation(ctx context.Context, m
 	return nil
 }
 
+// PatchStatus applies a raw JSON patch directly to the EtcdMember status subresource.
+func (c *K8sMemberClient) PatchStatus(ctx context.Context, memberName, namespace string, patchType types.PatchType, data []byte) error {
+	_, err := c.client.Resource(etcdMemberGVR).Namespace(namespace).Patch(
+		ctx,
+		memberName,
+		patchType,
+		data,
+		metav1.PatchOptions{},
+		"status",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to patch EtcdMember %s/%s status: %w", namespace, memberName, err)
+	}
+	return nil
+}
+
 // NoopClient is a no-op implementation of Client for testing.
 type NoopClient struct{}
 
@@ -168,5 +203,10 @@ func (n *NoopClient) UpdateStatus(_ context.Context, _, _ string, _ UpdateStatus
 
 // RemoveCreateAsLearnerAnnotation does nothing.
 func (n *NoopClient) RemoveCreateAsLearnerAnnotation(_ context.Context, _, _ string) error {
+	return nil
+}
+
+// PatchStatus does nothing.
+func (n *NoopClient) PatchStatus(_ context.Context, _, _ string, _ types.PatchType, _ []byte) error {
 	return nil
 }

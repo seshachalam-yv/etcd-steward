@@ -397,6 +397,242 @@ func TestUpdateStatus_PeerTLSEnabled_Nil(t *testing.T) {
 	}
 }
 
+func TestPatchStatus_CallsStatusSubresource(t *testing.T) {
+	client, rc := newMockClient()
+
+	data := []byte(`{"status":{"dbSize":"1Gi"}}`)
+	err := client.PatchStatus(context.Background(), "etcd-main-0", "default", types.MergePatchType, data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rc.patchCalls) != 1 {
+		t.Fatalf("expected 1 patch call, got %d", len(rc.patchCalls))
+	}
+	call := rc.patchCalls[0]
+	if call.subresource != "status" {
+		t.Errorf("expected status subresource, got %q", call.subresource)
+	}
+	if call.patchType != types.MergePatchType {
+		t.Errorf("expected MergePatchType, got %v", call.patchType)
+	}
+}
+
+func TestNoopClient_PatchStatus(t *testing.T) {
+	c := &NoopClient{}
+	err := c.PatchStatus(context.Background(), "member", "ns", types.MergePatchType, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestEtcdMemberGVR_Values(t *testing.T) {
+	gvr := EtcdMemberGVR()
+	if gvr.Group != "druid.gardener.cloud" {
+		t.Errorf("unexpected Group: %q", gvr.Group)
+	}
+	if gvr.Version != "v1alpha1" {
+		t.Errorf("unexpected Version: %q", gvr.Version)
+	}
+	if gvr.Resource != "etcdmembers" {
+		t.Errorf("unexpected Resource: %q", gvr.Resource)
+	}
+}
+
+func TestUpdateStatus_WithLastRestoration(t *testing.T) {
+	client, rc := newMockClient()
+
+	now := metav1.Now()
+	end := metav1.Now()
+	msg := "restored successfully"
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{
+		LastRestoration: &LastRestorationStatus{
+			Type:      "FromSnapshot",
+			Status:    "Succeeded",
+			StartTime: now,
+			EndTime:   &end,
+			Message:   &msg,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+	statusMap := patch["status"].(map[string]interface{})
+	restoration, ok := statusMap["lastRestoration"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected lastRestoration in status patch")
+	}
+	if restoration["type"] != "FromSnapshot" {
+		t.Errorf("expected type=FromSnapshot, got %v", restoration["type"])
+	}
+	if restoration["status"] != "Succeeded" {
+		t.Errorf("expected status=Succeeded, got %v", restoration["status"])
+	}
+	if restoration["message"] != "restored successfully" {
+		t.Errorf("expected message='restored successfully', got %v", restoration["message"])
+	}
+	if _, has := restoration["endTime"]; !has {
+		t.Error("expected endTime in lastRestoration")
+	}
+}
+
+func TestUpdateStatus_WithLastRestoration_NoEndTime(t *testing.T) {
+	client, rc := newMockClient()
+
+	now := metav1.Now()
+	err := client.UpdateStatus(context.Background(), "etcd-main-0", "default", UpdateStatusOpts{
+		LastRestoration: &LastRestorationStatus{
+			Type:      "FromLeader",
+			Status:    "InProgress",
+			StartTime: now,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+	statusMap := patch["status"].(map[string]interface{})
+	restoration := statusMap["lastRestoration"].(map[string]interface{})
+	if _, has := restoration["endTime"]; has {
+		t.Error("endTime should be absent when nil")
+	}
+	if _, has := restoration["message"]; has {
+		t.Error("message should be absent when nil")
+	}
+}
+
+func TestSetCondition_PatchesConditionsViaStatus(t *testing.T) {
+	// The mockResourceClient.Get returns an empty object (no conditions).
+	// SetCondition should upsert the new condition and patch the status.
+	client, rc := newMockClient()
+
+	err := client.SetCondition(context.Background(), "etcd-main-0", "default", Condition{
+		Type:    ConditionDataVolumeReadOnly,
+		Status:  "True",
+		Reason:  "ReadOnlyFS",
+		Message: "volume is read-only",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rc.patchCalls) != 1 {
+		t.Fatalf("expected 1 patch call, got %d", len(rc.patchCalls))
+	}
+	call := rc.patchCalls[0]
+	if call.subresource != "status" {
+		t.Errorf("expected status subresource for conditions patch, got %q", call.subresource)
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(call.data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+	statusMap, ok := patch["status"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected status map in patch")
+	}
+	conditions, ok := statusMap["conditions"].([]interface{})
+	if !ok {
+		t.Fatalf("expected conditions array in status, got %T", statusMap["conditions"])
+	}
+	if len(conditions) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(conditions))
+	}
+	cond := conditions[0].(map[string]interface{})
+	if cond["type"] != ConditionDataVolumeReadOnly {
+		t.Errorf("unexpected condition type: %v", cond["type"])
+	}
+	if cond["status"] != "True" {
+		t.Errorf("unexpected condition status: %v", cond["status"])
+	}
+}
+
+// conditionGetResourceClient extends mockResourceClient to return a specific Get result.
+type conditionGetResourceClient struct {
+	mockResourceClient
+	getResult *unstructured.Unstructured
+}
+
+func (c *conditionGetResourceClient) Namespace(_ string) dynamic.ResourceInterface {
+	return c
+}
+
+func (c *conditionGetResourceClient) Get(_ context.Context, _ string, _ metav1.GetOptions, _ ...string) (*unstructured.Unstructured, error) {
+	if c.getResult != nil {
+		return c.getResult, nil
+	}
+	obj := &unstructured.Unstructured{}
+	return obj, nil
+}
+
+type conditionGetDynamicClient struct {
+	resource *conditionGetResourceClient
+}
+
+func (c *conditionGetDynamicClient) Resource(_ schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return c.resource
+}
+
+func TestSetCondition_ExistingConditions_Upserted(t *testing.T) {
+	// Pre-populate the object with an existing condition.
+	existing := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"status": map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":               ConditionDataVolumeReadOnly,
+						"status":             "False",
+						"reason":             "VolumeOK",
+						"message":            "all good",
+						"lastTransitionTime": "2026-01-01T00:00:00Z",
+					},
+				},
+			},
+		},
+	}
+
+	rc := &conditionGetResourceClient{getResult: existing}
+	c := &K8sMemberClient{client: &conditionGetDynamicClient{resource: rc}}
+
+	err := c.SetCondition(context.Background(), "etcd-main-0", "default", Condition{
+		Type:    ConditionDataVolumeReadOnly,
+		Status:  "True", // changed
+		Reason:  "ReadOnlyFS",
+		Message: "volume is now read-only",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rc.patchCalls) != 1 {
+		t.Fatalf("expected 1 patch call, got %d", len(rc.patchCalls))
+	}
+
+	var patch map[string]interface{}
+	if err := json.Unmarshal(rc.patchCalls[0].data, &patch); err != nil {
+		t.Fatalf("failed to unmarshal patch: %v", err)
+	}
+	conditions := patch["status"].(map[string]interface{})["conditions"].([]interface{})
+	if len(conditions) != 1 {
+		t.Fatalf("expected 1 condition after upsert, got %d", len(conditions))
+	}
+	cond := conditions[0].(map[string]interface{})
+	if cond["status"] != "True" {
+		t.Errorf("expected updated status=True, got %v", cond["status"])
+	}
+	// Time must have changed since status changed.
+	if cond["lastTransitionTime"] == "2026-01-01T00:00:00Z" {
+		t.Error("lastTransitionTime should have been updated on status change")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		func() bool {

@@ -93,6 +93,100 @@ type nopWriteCloser struct{ w io.Writer }
 func (n *nopWriteCloser) Write(p []byte) (int, error) { return n.w.Write(p) }
 func (n *nopWriteCloser) Close() error                { return nil }
 
+func TestRunDeltaSnapshotLoop_CancelledImmediately(t *testing.T) {
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 1},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	done := make(chan struct{})
+	go func() {
+		s.RunDeltaSnapshotLoop(ctx, 1*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("RunDeltaSnapshotLoop did not stop on cancelled context")
+	}
+}
+
+func TestRunDeltaSnapshotLoop_ErrNotLeaderSilent(t *testing.T) {
+	// Non-leader: delta snapshot returns ErrNotLeader — loop must not crash.
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 1},
+		func() bool { return false }, // not leader
+		zap.NewNop(),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	// Must not panic or log error for ErrNotLeader.
+	s.RunDeltaSnapshotLoop(ctx, 5*time.Millisecond)
+}
+
+func TestRunDeltaSnapshotLoop_ErrNoFullSnapshot_Silent(t *testing.T) {
+	// Leader but no full snapshot taken — delta returns ErrNoFullSnapshot.
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 1},
+		func() bool { return true }, // is leader
+		zap.NewNop(),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	// No full snapshot taken first → ErrNoFullSnapshot should be handled silently.
+	s.RunDeltaSnapshotLoop(ctx, 5*time.Millisecond)
+}
+
+func TestRunFullSnapshotSchedule_CancelledImmediately(t *testing.T) {
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 5},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before starting
+
+	done := make(chan struct{})
+	go func() {
+		s.RunFullSnapshotSchedule(ctx, "24h")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("RunFullSnapshotSchedule did not stop on cancelled context")
+	}
+}
+
 func TestTriggerFullSnapshot_Success(t *testing.T) {
 	store := &mockSnapstore{}
 	snapAPI := &fakeSnapshotAPI{data: []byte("etcd-snapshot-data")}

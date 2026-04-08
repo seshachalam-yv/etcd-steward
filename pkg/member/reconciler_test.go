@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"go.uber.org/zap"
 
@@ -168,6 +169,140 @@ func TestMemberStatusReconciler_CtxCancellation(t *testing.T) {
 		// good
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Run did not stop after ctx cancellation within 500ms")
+	}
+}
+
+func TestMemberStatusReconciler_SnapshotFields_InPatch(t *testing.T) {
+	sz := resource.MustParse("50Mi")
+	now := metav1.Now()
+
+	fc := &fakeClient{}
+	r := member.NewStatusReconciler(fc, "etcd-0", "default", 10*time.Millisecond, zap.NewNop())
+	r.RegisterProvider("snap", &staticProvider{
+		info: member.StatusInfo{
+			Snapshots: &member.SnapshotInfo{
+				LastFull: &member.SnapshotEntry{
+					Name:          "Full-00000000-00000000-00000001",
+					Timestamp:     now,
+					StartRevision: 1,
+					EndRevision:   100,
+					Size:          &sz,
+				},
+				LastDelta: &member.SnapshotEntry{
+					Name:          "Incr-00000000-00000000-00000101",
+					Timestamp:     now,
+					StartRevision: 101,
+					EndRevision:   200,
+				},
+			},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if fc.patchCalls.Load() == 0 {
+		t.Fatal("expected at least one patch call")
+	}
+	data, _ := fc.lastPatchData.Load().([]byte)
+	patch := string(data)
+	for _, want := range []string{"lastFull", "lastDelta", "timestamp", "startRevision", "endRevision", "size"} {
+		if !contains(patch, want) {
+			t.Errorf("patch missing field %q; patch=%s", want, patch)
+		}
+	}
+}
+
+func TestMemberStatusReconciler_DefragFields_InPatch(t *testing.T) {
+	initialSz := resource.MustParse("800Mi")
+	finalSz := resource.MustParse("400Mi")
+	now := metav1.Now()
+	reason := "scheduled"
+	msg := "compacted successfully"
+
+	fc := &fakeClient{}
+	r := member.NewStatusReconciler(fc, "etcd-0", "default", 10*time.Millisecond, zap.NewNop())
+	r.RegisterProvider("defrag", &staticProvider{
+		info: member.StatusInfo{
+			LastDefragmentation: &member.DefragInfo{
+				StartTime:     now,
+				EndTime:       &now,
+				InitialDBSize: &initialSz,
+				FinalDBSize:   &finalSz,
+				Reason:        &reason,
+				Message:       &msg,
+			},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if fc.patchCalls.Load() == 0 {
+		t.Fatal("expected at least one patch call")
+	}
+	data, _ := fc.lastPatchData.Load().([]byte)
+	patch := string(data)
+	for _, want := range []string{"startTime", "endTime", "initialDBSize", "finalDBSize", "reason", "message"} {
+		if !contains(patch, want) {
+			t.Errorf("patch missing field %q; patch=%s", want, patch)
+		}
+	}
+}
+
+func TestMemberStatusReconciler_DefragNoOptionalFields(t *testing.T) {
+	now := metav1.Now()
+	fc := &fakeClient{}
+	r := member.NewStatusReconciler(fc, "etcd-0", "default", 10*time.Millisecond, zap.NewNop())
+	r.RegisterProvider("defrag", &staticProvider{
+		info: member.StatusInfo{
+			LastDefragmentation: &member.DefragInfo{StartTime: now},
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	data, _ := fc.lastPatchData.Load().([]byte)
+	patch := string(data)
+	for _, absent := range []string{"endTime", "initialDBSize", "finalDBSize", "reason", "message"} {
+		if contains(patch, absent) {
+			t.Errorf("patch should not contain %q when nil; patch=%s", absent, patch)
+		}
+	}
+}
+
+func TestInfoProviderFunc_ProvideInfo(t *testing.T) {
+	dbSize := resource.MustParse("1Gi")
+	f := member.InfoProviderFunc(func() member.StatusInfo {
+		return member.StatusInfo{DBSize: &dbSize}
+	})
+	info := f.ProvideInfo()
+	if info.DBSize == nil {
+		t.Fatal("expected non-nil DBSize")
+	}
+	if info.DBSize.String() != "1Gi" {
+		t.Errorf("unexpected DBSize: %s", info.DBSize.String())
+	}
+}
+
+func TestMemberStatusReconciler_InfoProviderFunc(t *testing.T) {
+	dbSize := resource.MustParse("2Gi")
+	fc := &fakeClient{}
+	r := member.NewStatusReconciler(fc, "etcd-0", "default", 10*time.Millisecond, zap.NewNop())
+	r.RegisterProvider("fn", member.InfoProviderFunc(func() member.StatusInfo {
+		return member.StatusInfo{DBSize: &dbSize}
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if fc.patchCalls.Load() == 0 {
+		t.Fatal("expected at least one patch call")
 	}
 }
 

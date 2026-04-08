@@ -210,6 +210,105 @@ func TestTransientErrorContinues(t *testing.T) {
 	}
 }
 
+func TestGetCurrentRole_DefaultMember(t *testing.T) {
+	api := &mockStatusAPI{}
+	api.addResponse(10, 20)
+	rec := &capturingRecorder{}
+	watcher := newTestWatcher(5*time.Minute, api, rec)
+
+	// Before any poll, GetCurrentRole must return RoleMember.
+	if got := watcher.GetCurrentRole(); got != RoleMember {
+		t.Errorf("expected RoleMember before any poll, got %v", got)
+	}
+}
+
+func TestGetCurrentRole_AfterBecomeLeader(t *testing.T) {
+	const memberID uint64 = 10
+	api := &mockStatusAPI{}
+	api.addResponse(memberID, memberID) // is leader
+
+	rec := &capturingRecorder{}
+	watcher := newTestWatcher(1*time.Millisecond, api, rec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	go watcher.Run(ctx, "localhost:2379")
+
+	// Wait until at least one poll has completed.
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		if watcher.GetCurrentRole() == RoleLeader {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for leader role")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	if got := watcher.GetCurrentRole(); got != RoleLeader {
+		t.Errorf("expected RoleLeader, got %v", got)
+	}
+}
+
+func TestProvideInfo_BeforePoll_Empty(t *testing.T) {
+	api := &mockStatusAPI{}
+	api.addResponse(10, 20)
+	rec := &capturingRecorder{}
+	watcher := newTestWatcher(5*time.Minute, api, rec)
+
+	info := watcher.ProvideInfo()
+	if info.DBSize != nil || info.DBSizeInUse != nil {
+		t.Error("expected nil DBSize/DBSizeInUse before any poll")
+	}
+}
+
+func TestProvideInfo_AfterPoll_HasDBSize(t *testing.T) {
+	const memberID uint64 = 10
+	api := &mockStatusAPI{}
+	// Return a response with non-zero db sizes.
+	resp := &clientv3.StatusResponse{}
+	resp.Header = &pb.ResponseHeader{MemberId: memberID}
+	resp.Leader = memberID
+	resp.DbSize = 100 * 1024 * 1024    // 100 MiB
+	resp.DbSizeInUse = 80 * 1024 * 1024 // 80 MiB
+	api.mu.Lock()
+	api.responses = append(api.responses, resp)
+	api.errors = append(api.errors, nil)
+	api.mu.Unlock()
+
+	rec := &capturingRecorder{}
+	watcher := newTestWatcher(1*time.Millisecond, api, rec)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	go watcher.Run(ctx, "localhost:2379")
+
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		info := watcher.ProvideInfo()
+		if info.DBSize != nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for DBSize to be populated")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	info := watcher.ProvideInfo()
+	if info.DBSize == nil {
+		t.Fatal("expected non-nil DBSize after poll")
+	}
+	if info.DBSizeInUse == nil {
+		t.Fatal("expected non-nil DBSizeInUse after poll")
+	}
+}
+
 func TestContextCancelStops(t *testing.T) {
 	api := &mockStatusAPI{}
 	api.addResponse(10, 20)

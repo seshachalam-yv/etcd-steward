@@ -136,5 +136,41 @@ func TestUpsertConditionLogic_NewType_Appended(t *testing.T) {
 	}
 }
 
+func TestUpsertConditionLogic_EmptyExisting(t *testing.T) {
+	result := member.UpsertConditionForTest(nil, member.Condition{
+		Type:   member.ConditionDataVolumeReadOnly,
+		Status: "False",
+		Reason: "VolumeOK",
+	})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(result))
+	}
+	if result[0].Type != member.ConditionDataVolumeReadOnly {
+		t.Errorf("unexpected type: %q", result[0].Type)
+	}
+	if result[0].Status != "False" {
+		t.Errorf("unexpected status: %q", result[0].Status)
+	}
+	if result[0].LastTransitionTime == "" {
+		t.Error("lastTransitionTime should be set for new condition")
+	}
+}
+
+func TestUpsertConditionLogic_WithExplicitTime(t *testing.T) {
+	fixedTime := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	result := member.UpsertConditionForTest(nil, member.Condition{
+		Type:               "SomeCondition",
+		Status:             "True",
+		Reason:             "Reason",
+		LastTransitionTime: metav1.Time{Time: fixedTime},
+	})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(result))
+	}
+	if result[0].LastTransitionTime != fixedTime.UTC().Format(time.RFC3339) {
+		t.Errorf("expected explicit time to be preserved, got %q", result[0].LastTransitionTime)
+	}
+}
+
 // Suppress unused import.
 var _ = types.MergePatchType

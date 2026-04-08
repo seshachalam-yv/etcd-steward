@@ -237,10 +237,7 @@ func TestGetCurrentRole_AfterBecomeLeader(t *testing.T) {
 
 	// Wait until at least one poll has completed.
 	deadline := time.After(100 * time.Millisecond)
-	for {
-		if watcher.GetCurrentRole() == RoleLeader {
-			break
-		}
+	for watcher.GetCurrentRole() != RoleLeader {
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for leader role")

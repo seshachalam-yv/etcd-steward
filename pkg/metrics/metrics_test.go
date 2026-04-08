@@ -60,7 +60,7 @@ func TestStateTransitionsTotal_Inc(t *testing.T) {
 	}
 }
 
-func TestInitializationDurationSeconds_Observe(t *testing.T) {
+func TestInitializationDurationSeconds_Observe(_ *testing.T) {
 	// Observe must not panic.
 	metrics.InitializationDurationSeconds.WithLabelValues("default", "etcd-main-0", "NewSingleNode").Observe(1.5)
 }

@@ -120,7 +120,7 @@ func TestRunDeltaSnapshotLoop_CancelledImmediately(t *testing.T) {
 	}
 }
 
-func TestRunDeltaSnapshotLoop_ErrNotLeaderSilent(t *testing.T) {
+func TestRunDeltaSnapshotLoop_ErrNotLeaderSilent(_ *testing.T) {
 	// Non-leader: delta snapshot returns ErrNotLeader — loop must not crash.
 	s := New(
 		&mockSnapstore{},
@@ -140,7 +140,7 @@ func TestRunDeltaSnapshotLoop_ErrNotLeaderSilent(t *testing.T) {
 	s.RunDeltaSnapshotLoop(ctx, 5*time.Millisecond)
 }
 
-func TestRunDeltaSnapshotLoop_ErrNoFullSnapshot_Silent(t *testing.T) {
+func TestRunDeltaSnapshotLoop_ErrNoFullSnapshot_Silent(_ *testing.T) {
 	// Leader but no full snapshot taken — delta returns ErrNoFullSnapshot.
 	s := New(
 		&mockSnapstore{},

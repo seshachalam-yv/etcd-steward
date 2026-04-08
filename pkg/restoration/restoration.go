@@ -108,10 +108,10 @@ func Restore(
 	}
 
 	if len(deltas) > 0 {
-		// TODO: implement delta replay (MVCC event replay onto bbolt DB).
-		// For Phase 2, we skip delta application. Full snapshot restoration is the
-		// primary recovery path. Delta replay will be implemented in Phase 3.
-		logger.Info("skipping delta application (not yet implemented)",
+		// Delta replay (MVCC event replay onto bbolt DB) is not yet implemented.
+		// v0.1.0 uses full-snapshot-only restoration. Incremental delta application
+		// will be added in a follow-up (etcd-steward#11).
+		logger.Info("skipping delta application — not implemented in v0.1.0 (see issue #11)",
 			zap.Int("deltaCount", len(deltas)),
 		)
 	}

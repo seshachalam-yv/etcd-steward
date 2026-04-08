@@ -616,8 +616,8 @@ func TestTryRestore_NilStore(t *testing.T) {
 	}
 }
 
-// TestTryRestore_EmptyStore verifies that tryRestore returns ErrNoSnapshotFound when
-// the store exists but contains no full snapshots.
+// TestTryRestore_EmptyStore verifies that tryRestore returns nil (not an error) when
+// the store exists but contains no full snapshots — this is a fresh cluster, not a failure.
 func TestTryRestore_EmptyStore(t *testing.T) {
 	dataDir := t.TempDir()
 	init := &Initializer{
@@ -626,8 +626,8 @@ func TestTryRestore_EmptyStore(t *testing.T) {
 		store:   &mockSnapstore{snaps: nil},
 	}
 	err := init.tryRestore(context.Background())
-	if err == nil {
-		t.Fatal("expected error from tryRestore with empty store")
+	if err != nil {
+		t.Fatalf("tryRestore with empty store should return nil (fresh cluster), got: %v", err)
 	}
 }
 

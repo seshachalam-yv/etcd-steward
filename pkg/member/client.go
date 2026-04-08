@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -143,6 +144,11 @@ func (c *K8sMemberClient) UpdateStatus(ctx context.Context, memberName, namespac
 		"status",
 	)
 	if err != nil {
+		// EtcdMember may not exist yet during early startup while etcd-druid creates it.
+		// Treat not-found as a transient condition — the StatusReconciler will retry.
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to patch EtcdMember %s/%s status: %w", namespace, memberName, err)
 	}
 	return nil
@@ -188,6 +194,9 @@ func (c *K8sMemberClient) PatchStatus(ctx context.Context, memberName, namespace
 		"status",
 	)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to patch EtcdMember %s/%s status: %w", namespace, memberName, err)
 	}
 	return nil

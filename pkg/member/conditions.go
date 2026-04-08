@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -60,6 +61,10 @@ func (c *K8sMemberClient) SetCondition(ctx context.Context, memberName, namespac
 
 	obj, err := resource.Get(ctx, memberName, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// EtcdMember not yet created by etcd-druid — transient, skip.
+			return nil
+		}
 		return fmt.Errorf("failed to get EtcdMember %s/%s: %w", namespace, memberName, err)
 	}
 

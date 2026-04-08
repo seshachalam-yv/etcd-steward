@@ -7,6 +7,7 @@ package initializer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -712,7 +713,7 @@ func (i *Initializer) tryRestore(ctx context.Context) error {
 		tempDir = i.dataDir + ".restoration.tmp"
 	}
 
-	return restoration.Restore(
+	err := restoration.Restore(
 		ctx,
 		i.store,
 		i.compressor,
@@ -723,4 +724,11 @@ func (i *Initializer) tryRestore(ctx context.Context) error {
 		i.initialCluster,
 		i.logger,
 	)
+	if errors.Is(err, restoration.ErrNoSnapshotFound) {
+		// No snapshots exist yet — this is a genuinely fresh cluster.
+		// Treat identically to "no store configured": etcd will bootstrap from scratch.
+		i.logger.Info("no snapshots found in store, skipping restoration -- etcd will start fresh")
+		return nil
+	}
+	return err
 }

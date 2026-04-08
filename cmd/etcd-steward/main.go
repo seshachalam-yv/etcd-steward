@@ -409,7 +409,21 @@ func main() {
 		}()
 	}
 
-	// Alarm handler.
+	// Alarm handler + status reconciler.
+	statusReconciler := member.NewStatusReconciler(
+		memberClient,
+		cfg.PodName, cfg.PodNamespace,
+		30*time.Second,
+		logger.Named("status-reconciler"),
+	)
+
+	// Register leaderwatch as a provider (always active).
+	statusReconciler.RegisterProvider("leaderwatch", watcher)
+
+	if snap != nil {
+		statusReconciler.RegisterProvider("snapshotter", snap)
+	}
+
 	if cfg.EnableAlarmHandler {
 		alarmHandler := alarm.New(
 			etcdClient,
@@ -420,6 +434,7 @@ func main() {
 			cfg.PodNamespace, cfg.EtcdName,
 			logger.Named("alarm"),
 		)
+		statusReconciler.RegisterProvider("alarm", alarmHandler)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -427,9 +442,26 @@ func main() {
 		}()
 	}
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := statusReconciler.Run(ctx); err != nil {
+			logger.Error("member status reconciler error", zap.Error(err))
+		}
+	}()
+
 	// Auto-start initialization with the determined mode.
 	if err := init.Start(ctx, string(valMode)); err != nil {
 		logger.Error("failed to start initialization", zap.Error(err))
+	}
+
+	// Write PeerTLSEnabled to EtcdMember status once at startup.
+	// Peer TLS is active when the peer URL uses the https scheme.
+	peerTLSEnabled := strings.HasPrefix(cfg.EtcdPeerURL, "https://")
+	if err := memberClient.UpdateStatus(ctx, cfg.PodName, cfg.PodNamespace, member.UpdateStatusOpts{
+		PeerTLSEnabled: &peerTLSEnabled,
+	}); err != nil {
+		logger.Warn("failed to set peerTLSEnabled on EtcdMember", zap.Error(err))
 	}
 
 	// Wait for context cancellation.

@@ -218,6 +218,10 @@ func (s *Server) handleSnapshotFull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "snapshots not configured", http.StatusNotImplemented)
 		return
 	}
+	if s.statusFn() != initializer.InitializationStatusSuccessful {
+		http.Error(w, "etcd not yet initialized", http.StatusServiceUnavailable)
+		return
+	}
 	snap, err := s.snapshotter.TriggerFullSnapshot(r.Context(), false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -235,6 +239,10 @@ func (s *Server) handleSnapshotDelta(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.snapshotter == nil {
 		http.Error(w, "snapshots not configured", http.StatusNotImplemented)
+		return
+	}
+	if s.statusFn() != initializer.InitializationStatusSuccessful {
+		http.Error(w, "etcd not yet initialized", http.StatusServiceUnavailable)
 		return
 	}
 	snap, err := s.snapshotter.TriggerDeltaSnapshot(r.Context())

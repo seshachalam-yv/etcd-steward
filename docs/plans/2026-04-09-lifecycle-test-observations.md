@@ -83,6 +83,15 @@ Both phases completed successfully in a single test run.
 - **Symptom**: `kubectl create secret tls --dry-run | apply` fails with "type field is immutable" on existing `Opaque` secrets
 - **Fix**: Use `kubectl patch secret --type=json` to update only the data fields
 
+### Observation 5: Snapshot handlers had no etcd readiness gate
+- **Symptom**: `POST /snapshot/full` and `POST /snapshot/delta` were accepted immediately even when
+  `InitializationStatus != Successful` — i.e., before etcd had elected a leader after pod restart
+- **Root cause**: `handleSnapshotFull`/`handleSnapshotDelta` in `pkg/server/handlers.go` called
+  `TriggerFullSnapshot`/`TriggerDeltaSnapshot` without checking initialization status
+- **Fix**: Added readiness gate in both handlers — return HTTP 503 when `statusFn() != Successful`
+- **Test coverage**: `TestHandleSnapshotFull_NotInitialized`, `TestHandleSnapshotDelta_NotInitialized`
+  in `pkg/server/server_test.go`
+
 ---
 
 ## Known Gaps
@@ -123,6 +132,13 @@ Both phases completed successfully in a single test run.
 ### `internal/component/statefulset/builder_test.go` (additions — etcd-druid fork)
 - `TestReadinessProbeScheme` — 4 cases
 
+### `pkg/server/server_test.go` (additions — etcd-steward fork)
+- `TestHandleSnapshotFull_NotInitialized`: POST /snapshot/full returns 503 when status != Successful
+- `TestHandleSnapshotDelta_NotInitialized`: POST /snapshot/delta returns 503 when status != Successful
+- Updated `TestHandleSnapshotFull_SnapshotterError`, `TestHandleSnapshotFull_Success`,
+  `TestHandleSnapshotDelta_SnapshotterError`, `TestHandleSnapshotDelta_Success`
+  to use `InitializationStatusSuccessful` (required to pass readiness gate)
+
 ---
 
 ## Final State
@@ -133,7 +149,7 @@ All tests pass:
 - `go test ./test/utils/...` in etcd-druid: 2 new tests, all pass
 - `go test ./internal/component/statefulset/...` in etcd-druid: all tests pass
 
-End-to-end lifecycle verified:
-- Phase A (no TLS): ✅ write → full snap → delta → delta snap → restore → verify (8 keys at rev 10)
-- Phase B (TLS): ✅ write → full snap → delta → delta snap → restore → verify (11 keys at rev 13)
+End-to-end lifecycle verified (second full run):
+- Phase A (no TLS): ✅ write → full snap → delta → delta snap → restore → verify (3 keys at rev 4)
+- Phase B (TLS): ✅ write → full snap → delta → delta snap → restore → verify (6 keys at rev 7)
 - TLS connectivity verified via FQDN with proper cert SANs

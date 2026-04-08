@@ -373,7 +373,7 @@ func TestHandleSnapshotFull_MethodNotAllowed(t *testing.T) {
 func TestHandleSnapshotFull_SnapshotterError(t *testing.T) {
 	snap := &mockSnapshotter{fullErr: fmt.Errorf("full snapshot failed")}
 	s := NewServer(0,
-		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
+		func() initializer.InitializationStatus { return initializer.InitializationStatusSuccessful },
 		func(_ context.Context, _ string) error { return nil },
 		nil, snap, nil,
 		zap.NewNop(),
@@ -392,7 +392,7 @@ func TestHandleSnapshotFull_Success(t *testing.T) {
 	returned := &snapstore.Snapshot{Kind: "Full", LastRevision: 42}
 	snap := &mockSnapshotter{fullSnap: returned}
 	s := NewServer(0,
-		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
+		func() initializer.InitializationStatus { return initializer.InitializationStatusSuccessful },
 		func(_ context.Context, _ string) error { return nil },
 		nil, snap, nil,
 		zap.NewNop(),
@@ -429,7 +429,7 @@ func TestHandleSnapshotDelta_MethodNotAllowed(t *testing.T) {
 func TestHandleSnapshotDelta_SnapshotterError(t *testing.T) {
 	snap := &mockSnapshotter{deltaErr: fmt.Errorf("delta snapshot failed")}
 	s := NewServer(0,
-		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
+		func() initializer.InitializationStatus { return initializer.InitializationStatusSuccessful },
 		func(_ context.Context, _ string) error { return nil },
 		nil, snap, nil,
 		zap.NewNop(),
@@ -448,7 +448,7 @@ func TestHandleSnapshotDelta_Success(t *testing.T) {
 	returned := &snapstore.Snapshot{Kind: "Incremental", LastRevision: 100}
 	snap := &mockSnapshotter{deltaSnap: returned}
 	s := NewServer(0,
-		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
+		func() initializer.InitializationStatus { return initializer.InitializationStatusSuccessful },
 		func(_ context.Context, _ string) error { return nil },
 		nil, snap, nil,
 		zap.NewNop(),
@@ -463,6 +463,52 @@ func TestHandleSnapshotDelta_Success(t *testing.T) {
 	}
 	if ct := w.Result().Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Readiness gate tests — snapshot endpoints return 503 before initialization
+// ---------------------------------------------------------------------------
+
+func TestHandleSnapshotFull_NotInitialized(t *testing.T) {
+	snap := &mockSnapshotter{fullSnap: &snapstore.Snapshot{Kind: "Full", LastRevision: 1}}
+	s := NewServer(0,
+		// statusFn returns InProgress — etcd not yet ready.
+		func() initializer.InitializationStatus { return initializer.InitializationStatusInProgress },
+		func(_ context.Context, _ string) error { return nil },
+		nil, snap, nil,
+		zap.NewNop(),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/snapshot/full", nil)
+	w := httptest.NewRecorder()
+	s.handleSnapshotFull(w, req)
+
+	// Must return 503 — snapshot should not be triggered before etcd is initialized.
+	if w.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d (etcd not initialized should block snapshot)",
+			w.Result().StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHandleSnapshotDelta_NotInitialized(t *testing.T) {
+	snap := &mockSnapshotter{deltaSnap: &snapstore.Snapshot{Kind: "Incremental", LastRevision: 2}}
+	s := NewServer(0,
+		// statusFn returns New — etcd never started.
+		func() initializer.InitializationStatus { return initializer.InitializationStatusNew },
+		func(_ context.Context, _ string) error { return nil },
+		nil, snap, nil,
+		zap.NewNop(),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/snapshot/delta", nil)
+	w := httptest.NewRecorder()
+	s.handleSnapshotDelta(w, req)
+
+	// Must return 503 — delta snapshot should not be triggered before etcd is initialized.
+	if w.Result().StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d (etcd not initialized should block delta snapshot)",
+			w.Result().StatusCode, http.StatusServiceUnavailable)
 	}
 }
 

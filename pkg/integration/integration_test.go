@@ -17,11 +17,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/gardener/etcd-steward/pkg/compression"
 	"github.com/gardener/etcd-steward/pkg/etcdclient"
@@ -307,7 +310,71 @@ func TestHTTPLifecycle_PathA(t *testing.T) {
 	}
 }
 
-// TestServerReachableBeforeInit verifies the server responds to /healthz
+// TestMemberStatusReconciler_StartsAndStops verifies that MemberStatusReconciler starts,
+// ticks at least once with noop providers, and stops cleanly on context cancellation.
+func TestMemberStatusReconciler_StartsAndStops(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	reconciler := member.NewStatusReconciler(
+		&member.NoopClient{},
+		"etcd-main-0", "default",
+		50*time.Millisecond, // fast interval for the test
+		zap.NewNop(),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- reconciler.Run(ctx)
+	}()
+
+	// Cancel context after 200ms — long enough for several ticks.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("reconciler returned unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("reconciler did not stop within 2s after ctx cancellation")
+	}
+}
+
+// TestMemberStatusReconciler_WithNoopProviders verifies that registering noop-style
+// providers does not cause panics or errors during reconcile ticks.
+func TestMemberStatusReconciler_WithNoopProviders(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	reconciler := member.NewStatusReconciler(
+		&member.NoopClient{},
+		"etcd-main-0", "default",
+		50*time.Millisecond,
+		zap.NewNop(),
+	)
+
+	// Register a provider that returns empty StatusInfo (like leaderwatch before first poll).
+	reconciler.RegisterProvider("empty", member.InfoProviderFunc(func() member.StatusInfo {
+		return member.StatusInfo{}
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- reconciler.Run(ctx)
+	}()
+
+	<-ctx.Done()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("reconciler returned unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("reconciler did not stop within 2s")
+	}
+}
 // immediately — before initialization begins (etcd-wrapper contract).
 func TestServerReachableBeforeInit(t *testing.T) {
 	dataDir := t.TempDir()
@@ -352,4 +419,57 @@ func TestServerReachableBeforeInit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Error("server was not reachable within 500ms (before init started)")
+}
+
+// countingMemberClient is a member.Client that counts PatchStatus calls.
+type countingMemberClient struct {
+	member.NoopClient
+	patchCount atomic.Int32
+}
+
+func (c *countingMemberClient) PatchStatus(_ context.Context, _, _ string, _ types.PatchType, _ []byte) error {
+	c.patchCount.Add(1)
+	return nil
+}
+
+// TestMemberStatusReconciler_PatchesEtcdMember verifies the full status-update path:
+// reconciler ticks → calls registered providers → calls Client.PatchStatus.
+func TestMemberStatusReconciler_PatchesEtcdMember(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &countingMemberClient{}
+	reconciler := member.NewStatusReconciler(
+		client,
+		"etcd-main-0", "default",
+		30*time.Millisecond, // fast interval
+		zap.NewNop(),
+	)
+
+	// Register a provider that returns non-empty StatusInfo (triggers a patch).
+	dbSize := resource.NewMilliQuantity(1024*1000, resource.BinarySI)
+	reconciler.RegisterProvider("leaderwatch", member.InfoProviderFunc(func() member.StatusInfo {
+		return member.StatusInfo{DBSize: dbSize}
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- reconciler.Run(ctx)
+	}()
+
+	// Wait for at least 3 patch calls (3 ticks × 30ms = 90ms; allow 1s).
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if client.patchCount.Load() >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+
+	if got := client.patchCount.Load(); got < 3 {
+		t.Errorf("expected at least 3 PatchStatus calls, got %d", got)
+	}
 }

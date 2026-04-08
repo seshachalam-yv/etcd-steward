@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"os/signal"
@@ -215,10 +217,35 @@ func main() {
 	}
 
 	// Build etcd client.
-	etcdClient, err := clientv3.New(clientv3.Config{
+	etcdClientCfg := clientv3.Config{
 		Endpoints:   []string{cfg.EtcdEndpoint},
 		DialTimeout: 5 * time.Second,
-	})
+	}
+
+	// Configure TLS if cacert/cert/key flags are provided.
+	caCertPath, _ := fs.GetString("cacert")
+	certPath, _ := fs.GetString("cert")
+	keyPath, _ := fs.GetString("key")
+	if caCertPath != "" && certPath != "" && keyPath != "" {
+		caCert, err := os.ReadFile(caCertPath)
+		if err != nil {
+			logger.Fatal("failed to read CA cert", zap.String("path", caCertPath), zap.Error(err))
+		}
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caCert) {
+			logger.Fatal("failed to parse CA cert", zap.String("path", caCertPath))
+		}
+		clientCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			logger.Fatal("failed to load client cert/key", zap.Error(err))
+		}
+		etcdClientCfg.TLS = &tls.Config{
+			Certificates: []tls.Certificate{clientCert},
+			RootCAs:      caPool,
+		}
+	}
+
+	etcdClient, err := clientv3.New(etcdClientCfg)
 	if err != nil {
 		logger.Fatal("failed to create etcd client", zap.Error(err))
 	}
@@ -361,6 +388,10 @@ func main() {
 		watcher.Run(ctx, cfg.EtcdEndpoint)
 	}()
 
+	// peerTLSEnabled is true when the peer URL uses the https scheme.
+	// Used both for lease annotation and EtcdMember status.
+	peerTLSEnabled := strings.HasPrefix(cfg.EtcdPeerURL, "https://")
+
 	// Member lease renewal.
 	if cfg.EnableMemberLeaseRenewal {
 		leaseRenewer := lease.New(
@@ -374,6 +405,7 @@ func main() {
 				role := string(watcher.GetCurrentRole())
 				return memberID, clusterID, role
 			},
+			peerTLSEnabled,
 			logger.Named("lease"),
 		)
 		wg.Add(1)
@@ -457,7 +489,6 @@ func main() {
 
 	// Write PeerTLSEnabled to EtcdMember status once at startup.
 	// Peer TLS is active when the peer URL uses the https scheme.
-	peerTLSEnabled := strings.HasPrefix(cfg.EtcdPeerURL, "https://")
 	if err := memberClient.UpdateStatus(ctx, cfg.PodName, cfg.PodNamespace, member.UpdateStatusOpts{
 		PeerTLSEnabled: &peerTLSEnabled,
 	}); err != nil {

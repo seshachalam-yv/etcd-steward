@@ -8,6 +8,7 @@ package lease
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -16,6 +17,10 @@ import (
 	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	"go.uber.org/zap"
 )
+
+// LeaseAnnotationKeyPeerURLTLSEnabled is the annotation key etcd-druid reads from member leases
+// to gate StatefulSet updates during TLS enablement/disablement.
+const LeaseAnnotationKeyPeerURLTLSEnabled = "member.etcd.gardener.cloud/tls-enabled"
 
 // StateFunc returns the current member ID, cluster ID, and role for the lease holder identity.
 type StateFunc func() (memberID, clusterID, role string)
@@ -29,6 +34,7 @@ type Renewer struct {
 	leaseDuration     int32
 	client            coordinationv1client.LeasesGetter
 	stateFunc         StateFunc
+	peerTLSEnabled    bool
 	logger            *zap.Logger
 
 	// cachedMemberID and cachedClusterID hold the last successfully obtained
@@ -45,6 +51,7 @@ func New(
 	heartbeatInterval time.Duration,
 	client coordinationv1client.LeasesGetter,
 	stateFunc StateFunc,
+	peerTLSEnabled bool,
 	logger *zap.Logger,
 ) *Renewer {
 	return &Renewer{
@@ -55,6 +62,7 @@ func New(
 		leaseDuration:     int32(heartbeatInterval.Seconds()) * 3,
 		client:            client,
 		stateFunc:         stateFunc,
+		peerTLSEnabled:    peerTLSEnabled,
 		logger:            logger,
 	}
 }
@@ -114,6 +122,10 @@ func (r *Renewer) renew(ctx context.Context) error {
 	updated.Spec.RenewTime = &now
 	leaseDuration := r.leaseDuration
 	updated.Spec.LeaseDurationSeconds = &leaseDuration
+	if updated.Annotations == nil {
+		updated.Annotations = make(map[string]string)
+	}
+	updated.Annotations[LeaseAnnotationKeyPeerURLTLSEnabled] = strconv.FormatBool(r.peerTLSEnabled)
 
 	if _, err := leaseClient.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("failed to update lease %s/%s: %w", r.namespace, r.leaseName, err)
@@ -128,6 +140,9 @@ func (r *Renewer) createLease(ctx context.Context, leaseClient coordinationv1cli
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      r.leaseName,
 			Namespace: r.namespace,
+			Annotations: map[string]string{
+				LeaseAnnotationKeyPeerURLTLSEnabled: strconv.FormatBool(r.peerTLSEnabled),
+			},
 		},
 		Spec: coordinationv1.LeaseSpec{
 			HolderIdentity:       &holderIdentity,

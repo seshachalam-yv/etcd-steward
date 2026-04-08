@@ -107,6 +107,7 @@ func newTestRenewer(client *mockLeaseClient, stateFunc StateFunc) *Renewer {
 		leaseDuration:     30,
 		client:            &mockLeasesGetter{leaseClient: client},
 		stateFunc:         stateFunc,
+		peerTLSEnabled:    false,
 		logger:            logger,
 	}
 }
@@ -289,6 +290,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		leaseDuration:     3600,
 		client:            &mockLeasesGetter{leaseClient: client},
 		stateFunc:         constState("aaa", "bbb", "Leader"),
+		peerTLSEnabled:    false,
 		logger:            logger,
 	}
 
@@ -307,5 +309,88 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 		// good
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop after context cancellation within 2s")
+	}
+}
+
+func TestRenewSetsPeerTLSAnnotation(t *testing.T) {
+	tests := []struct {
+		name           string
+		peerTLSEnabled bool
+		wantAnnotation string
+	}{
+		{
+			name:           "TLS disabled",
+			peerTLSEnabled: false,
+			wantAnnotation: "false",
+		},
+		{
+			name:           "TLS enabled",
+			peerTLSEnabled: true,
+			wantAnnotation: "true",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mockLeaseClient{}
+			logger, _ := zap.NewDevelopment()
+			r := &Renewer{
+				leaseName:         "etcd-main-0",
+				namespace:         "default",
+				heartbeatInterval: 10 * time.Second,
+				leaseDuration:     30,
+				client:            &mockLeasesGetter{leaseClient: client},
+				stateFunc:         constState("aaa", "bbb", "Leader"),
+				peerTLSEnabled:    tc.peerTLSEnabled,
+				logger:            logger,
+			}
+
+			if err := r.renew(context.Background()); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if client.lease == nil {
+				t.Fatal("expected lease to be created")
+			}
+			got := client.lease.Annotations[LeaseAnnotationKeyPeerURLTLSEnabled]
+			if got != tc.wantAnnotation {
+				t.Errorf("annotation %q = %q, want %q",
+					LeaseAnnotationKeyPeerURLTLSEnabled, got, tc.wantAnnotation)
+			}
+		})
+	}
+}
+
+func TestRenewPreservesPeerTLSAnnotationOnUpdate(t *testing.T) {
+	// Existing lease has no annotation; after renew it must have the correct annotation.
+	oldIdentity := "old:old:Member"
+	existing := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd-main-0",
+			Namespace: "default",
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity: &oldIdentity,
+		},
+	}
+	client := &mockLeaseClient{lease: existing}
+	logger, _ := zap.NewDevelopment()
+	r := &Renewer{
+		leaseName:         "etcd-main-0",
+		namespace:         "default",
+		heartbeatInterval: 10 * time.Second,
+		leaseDuration:     30,
+		client:            &mockLeasesGetter{leaseClient: client},
+		stateFunc:         constState("aaa", "bbb", "Leader"),
+		peerTLSEnabled:    true,
+		logger:            logger,
+	}
+
+	if err := r.renew(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := client.lease.Annotations[LeaseAnnotationKeyPeerURLTLSEnabled]
+	if got != "true" {
+		t.Errorf("expected annotation to be 'true' after update, got %q", got)
 	}
 }

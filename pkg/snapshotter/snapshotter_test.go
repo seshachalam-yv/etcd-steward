@@ -289,3 +289,141 @@ func TestTriggerFullSnapshot_UpdatesLastRevision(t *testing.T) {
 	}
 	s.mu.Unlock()
 }
+
+func TestProvideInfo_BeforeAnySnapshot(t *testing.T) {
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 10},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	info := s.ProvideInfo()
+	if info.Snapshots != nil {
+		t.Error("expected nil Snapshots before any snapshot taken")
+	}
+}
+
+func TestProvideInfo_AfterFullSnapshot(t *testing.T) {
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("etcd-data")},
+		&fakeWatchAPI{},
+		&fakeStatusAPI{revision: 42},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	if _, err := s.TriggerFullSnapshot(context.Background(), false); err != nil {
+		t.Fatalf("TriggerFullSnapshot error: %v", err)
+	}
+
+	info := s.ProvideInfo()
+	if info.Snapshots == nil {
+		t.Fatal("expected non-nil Snapshots after full snapshot")
+	}
+	if info.Snapshots.LastFull == nil {
+		t.Fatal("expected LastFull to be set")
+	}
+	if info.Snapshots.LastFull.EndRevision != 42 {
+		t.Errorf("LastFull.EndRevision = %d, want 42", info.Snapshots.LastFull.EndRevision)
+	}
+	if info.Snapshots.AccumulatedDeltaSize == nil {
+		t.Error("AccumulatedDeltaSize should be set (to zero) after full snapshot")
+	} else if !info.Snapshots.AccumulatedDeltaSize.IsZero() {
+		t.Errorf("AccumulatedDeltaSize should be zero after full snapshot, got %v", info.Snapshots.AccumulatedDeltaSize)
+	}
+}
+
+func TestProvideInfo_FullThenDelta_DeltaAccumulates(t *testing.T) {
+	events := []*clientv3.Event{
+		{
+			Type: clientv3.EventTypePut,
+			Kv: &mvccpb.KeyValue{
+				Key: []byte("k"), Value: []byte("v"), ModRevision: 50,
+			},
+		},
+	}
+
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("snap")},
+		&fakeWatchAPI{events: events},
+		&fakeStatusAPI{revision: 42},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	// Take full snapshot first.
+	if _, err := s.TriggerFullSnapshot(context.Background(), false); err != nil {
+		t.Fatalf("TriggerFullSnapshot error: %v", err)
+	}
+
+	// Take delta.
+	if _, err := s.TriggerDeltaSnapshot(context.Background()); err != nil {
+		t.Fatalf("TriggerDeltaSnapshot error: %v", err)
+	}
+
+	info := s.ProvideInfo()
+	if info.Snapshots == nil {
+		t.Fatal("expected Snapshots to be set")
+	}
+	if info.Snapshots.LastDelta == nil {
+		t.Fatal("expected LastDelta to be set after delta snapshot")
+	}
+	if info.Snapshots.LastDelta.EndRevision != 50 {
+		t.Errorf("LastDelta.EndRevision = %d, want 50", info.Snapshots.LastDelta.EndRevision)
+	}
+	if info.Snapshots.AccumulatedDeltaSize == nil || info.Snapshots.AccumulatedDeltaSize.IsZero() {
+		t.Error("AccumulatedDeltaSize should be non-zero after delta snapshot")
+	}
+}
+
+func TestProvideInfo_FullAfterDelta_ResetsAccumulation(t *testing.T) {
+	events := []*clientv3.Event{
+		{
+			Type: clientv3.EventTypePut,
+			Kv:   &mvccpb.KeyValue{Key: []byte("k"), Value: []byte("v"), ModRevision: 50},
+		},
+	}
+
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("snap")},
+		&fakeWatchAPI{events: events},
+		&fakeStatusAPI{revision: 42},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	// Full → delta → full.
+	if _, err := s.TriggerFullSnapshot(context.Background(), false); err != nil {
+		t.Fatalf("first TriggerFullSnapshot error: %v", err)
+	}
+	if _, err := s.TriggerDeltaSnapshot(context.Background()); err != nil {
+		t.Fatalf("TriggerDeltaSnapshot error: %v", err)
+	}
+	// Second full snapshot should reset delta accumulation.
+	if _, err := s.TriggerFullSnapshot(context.Background(), false); err != nil {
+		t.Fatalf("second TriggerFullSnapshot error: %v", err)
+	}
+
+	info := s.ProvideInfo()
+	if info.Snapshots == nil || info.Snapshots.AccumulatedDeltaSize == nil {
+		t.Fatal("expected AccumulatedDeltaSize to be set")
+	}
+	if !info.Snapshots.AccumulatedDeltaSize.IsZero() {
+		t.Errorf("AccumulatedDeltaSize should reset to zero after second full snapshot, got %v",
+			info.Snapshots.AccumulatedDeltaSize)
+	}
+}

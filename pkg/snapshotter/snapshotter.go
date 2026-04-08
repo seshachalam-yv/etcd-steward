@@ -16,8 +16,11 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gardener/etcd-steward/pkg/compression"
+	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/metrics"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
 )
@@ -59,8 +62,10 @@ type Snapshotter struct {
 	isLeader    func() bool
 	logger      *zap.Logger
 
-	mu           sync.Mutex
-	lastRevision int64
+	mu                   sync.Mutex
+	lastRevision         int64
+	snapshotInfo         member.SnapshotInfo // tracks latest snapshot metadata for InfoProvider
+	accumulatedDeltaBytes int64              // running total of uncompressed delta sizes
 }
 
 // New creates a Snapshotter with the given dependencies.
@@ -96,13 +101,9 @@ func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*s
 
 	start := time.Now()
 
-	// Get current revision for snapshot metadata.
-	currentRev, err := s.getCurrentRevision(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current revision: %w", err)
-	}
-
-	// Take etcd snapshot.
+	// Take etcd snapshot first, then read the revision from the cluster.
+	// The revision is queried AFTER the snapshot stream starts so it reflects
+	// the actual state captured in the snapshot file, not a pre-snapshot estimate.
 	reader, err := s.snapshotAPI.Snapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to take etcd snapshot: %w", err)
@@ -113,6 +114,14 @@ func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*s
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read snapshot data: %w", err)
+	}
+
+	// Get the revision after the snapshot has been fully streamed.
+	// This revision matches what was captured in the snapshot more closely
+	// than a pre-snapshot status call.
+	currentRev, err := s.getCurrentRevision(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current revision: %w", err)
 	}
 
 	// Compress.
@@ -142,8 +151,23 @@ func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*s
 		return nil, fmt.Errorf("failed to save full snapshot: %w", err)
 	}
 
+	uncompressedSize := int64(len(data))
 	s.mu.Lock()
 	s.lastRevision = currentRev
+	s.accumulatedDeltaBytes = 0
+	qty := resource.NewMilliQuantity(uncompressedSize*1000, resource.BinarySI)
+	zero := resource.MustParse("0")
+	s.snapshotInfo = member.SnapshotInfo{
+		LastFull: &member.SnapshotEntry{
+			Name:          snap.SnapName,
+			Timestamp:     metav1.NewTime(now),
+			StartRevision: 0,
+			EndRevision:   currentRev,
+			Size:          qty,
+		},
+		LastDelta:            s.snapshotInfo.LastDelta, // preserve existing delta
+		AccumulatedDeltaSize: &zero,
+	}
 	s.mu.Unlock()
 
 	duration := time.Since(start).Seconds()
@@ -242,8 +266,20 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 		return nil, fmt.Errorf("failed to save delta snapshot: %w", err)
 	}
 
+	deltaSize := int64(events.Len())
 	s.mu.Lock()
 	s.lastRevision = lastRev
+	s.accumulatedDeltaBytes += deltaSize
+	accDeltaQty := resource.NewMilliQuantity(s.accumulatedDeltaBytes*1000, resource.BinarySI)
+	deltaQty := resource.NewMilliQuantity(deltaSize*1000, resource.BinarySI)
+	s.snapshotInfo.LastDelta = &member.SnapshotEntry{
+		Name:          snap.SnapName,
+		Timestamp:     metav1.NewTime(now),
+		StartRevision: startRev,
+		EndRevision:   lastRev,
+		Size:          deltaQty,
+	}
+	s.snapshotInfo.AccumulatedDeltaSize = accDeltaQty
 	s.mu.Unlock()
 
 	duration := time.Since(start).Seconds()
@@ -318,4 +354,17 @@ func (s *Snapshotter) getCurrentRevision(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return resp.Header.Revision, nil
+}
+
+// ProvideInfo implements member.InfoProvider.
+// Returns the latest snapshot metadata collected by this Snapshotter.
+// Safe to call concurrently with TriggerFullSnapshot and TriggerDeltaSnapshot.
+func (s *Snapshotter) ProvideInfo() member.StatusInfo {
+	s.mu.Lock()
+	info := s.snapshotInfo // copy under lock
+	s.mu.Unlock()
+	if info.LastFull == nil && info.LastDelta == nil {
+		return member.StatusInfo{}
+	}
+	return member.StatusInfo{Snapshots: &info}
 }

@@ -8,12 +8,16 @@ package alarm
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/metrics"
 )
 
@@ -41,6 +45,9 @@ type Handler struct {
 	namespace          string
 	name               string
 	logger             *zap.Logger
+
+	mu         sync.Mutex
+	lastDefrag *member.DefragInfo // set after every defragmentation
 }
 
 // New creates a Handler that polls for etcd alarms and remediates NOSPACE.
@@ -125,13 +132,14 @@ func (h *Handler) check(ctx context.Context) error {
 
 // remediateNOSPACE handles the NOSPACE alarm by compacting, defragmenting, and disarming.
 func (h *Handler) remediateNOSPACE(ctx context.Context, alarm *clientv3.AlarmMember) error {
-	// Get current revision.
+	// Get current revision and initial DB size.
 	statusResp, err := h.maintenance.Status(ctx, h.endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to get status: %w", err)
 	}
 
 	currentRev := statusResp.Header.Revision
+	initialDBBytes := statusResp.DbSize
 	compactRev := currentRev - h.compactRevisionLag
 	if compactRev < 1 {
 		compactRev = 1
@@ -146,9 +154,40 @@ func (h *Handler) remediateNOSPACE(ctx context.Context, alarm *clientv3.AlarmMem
 		return fmt.Errorf("compact failed at revision %d: %w", compactRev, err)
 	}
 
+	reason := "NSPACEAlarm"
+	startTime := metav1.Now()
 	h.logger.Info("defragmenting", zap.String("endpoint", h.endpoint))
-	if _, err := h.maintenance.Defragment(ctx, h.endpoint); err != nil {
-		return fmt.Errorf("defragment failed: %w", err)
+	_, defragErr := h.maintenance.Defragment(ctx, h.endpoint)
+
+	endTime := metav1.Now()
+
+	// Get final DB size (best-effort; use 0 if unavailable).
+	var finalDBBytes int64
+	if postStatus, err := h.maintenance.Status(ctx, h.endpoint); err == nil {
+		finalDBBytes = postStatus.DbSize
+	}
+
+	initialQty := resource.NewMilliQuantity(initialDBBytes*1000, resource.BinarySI)
+	finalQty := resource.NewMilliQuantity(finalDBBytes*1000, resource.BinarySI)
+
+	defragInfo := &member.DefragInfo{
+		StartTime:     startTime,
+		EndTime:       &endTime,
+		InitialDBSize: initialQty,
+		FinalDBSize:   finalQty,
+		Reason:        &reason,
+	}
+	if defragErr != nil {
+		msg := defragErr.Error()
+		defragInfo.Message = &msg
+	}
+
+	h.mu.Lock()
+	h.lastDefrag = defragInfo
+	h.mu.Unlock()
+
+	if defragErr != nil {
+		return fmt.Errorf("defragment failed: %w", defragErr)
 	}
 
 	h.logger.Info("disarming NOSPACE alarm", zap.Uint64("memberID", alarm.MemberID))
@@ -158,4 +197,18 @@ func (h *Handler) remediateNOSPACE(ctx context.Context, alarm *clientv3.AlarmMem
 
 	h.logger.Info("NOSPACE alarm remediated successfully")
 	return nil
+}
+
+// ProvideInfo implements member.InfoProvider.
+// Returns the most recent defragmentation info collected by this Handler.
+// Safe to call concurrently with Run.
+func (h *Handler) ProvideInfo() member.StatusInfo {
+	h.mu.Lock()
+	d := h.lastDefrag
+	h.mu.Unlock()
+	if d == nil {
+		return member.StatusInfo{}
+	}
+	snapshot := *d
+	return member.StatusInfo{LastDefragmentation: &snapshot}
 }

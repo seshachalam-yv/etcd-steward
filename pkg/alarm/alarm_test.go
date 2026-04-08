@@ -7,6 +7,7 @@ package alarm
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 type fakeMaintenance struct {
 	alarms        []*pb.AlarmMember
 	statusRev     int64
-	defragCalled  bool
+	defragCalled  atomic.Bool
 	disarmed      []*clientv3.AlarmMember
 	alarmListErr  error
 	statusErr     error
@@ -43,7 +44,7 @@ func (f *fakeMaintenance) AlarmDisarm(_ context.Context, m *clientv3.AlarmMember
 }
 
 func (f *fakeMaintenance) Defragment(_ context.Context, _ string) (*clientv3.DefragmentResponse, error) {
-	f.defragCalled = true
+	f.defragCalled.Store(true)
 	if f.defragErr != nil {
 		return nil, f.defragErr
 	}
@@ -81,7 +82,7 @@ func TestHandler_NoAlarms(t *testing.T) {
 	if err := h.check(context.Background()); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
-	if m.defragCalled {
+	if m.defragCalled.Load() {
 		t.Error("defrag should not be called when no alarms")
 	}
 }
@@ -105,7 +106,7 @@ func TestHandler_NOSPACE_Remediation(t *testing.T) {
 		t.Errorf("compact revision = %d, want %d", kv.compactedRev, expectedCompactRev)
 	}
 
-	if !m.defragCalled {
+	if !m.defragCalled.Load() {
 		t.Error("expected defragment to be called")
 	}
 
@@ -133,7 +134,7 @@ func TestHandler_CORRUPT_NoDisarm(t *testing.T) {
 	if len(m.disarmed) != 0 {
 		t.Error("CORRUPT alarm should not be disarmed")
 	}
-	if m.defragCalled {
+	if m.defragCalled.Load() {
 		t.Error("defrag should not be called for CORRUPT alarm")
 	}
 }
@@ -174,7 +175,7 @@ func TestHandler_Mixed_NOSPACE_And_CORRUPT(t *testing.T) {
 	}
 
 	// NOSPACE should be remediated (compact + defrag + disarm).
-	if !m.defragCalled {
+	if !m.defragCalled.Load() {
 		t.Error("expected defragment for NOSPACE")
 	}
 	// Only NOSPACE should be disarmed, not CORRUPT.
@@ -253,7 +254,7 @@ func TestHandler_RemediateNOSPACE_CompactError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when compact fails, got nil")
 	}
-	if m.defragCalled {
+	if m.defragCalled.Load() {
 		t.Error("defrag should not be called after compact error")
 	}
 }
@@ -374,7 +375,7 @@ func TestHandler_Run_CallsCheckOnTick(t *testing.T) {
 			<-done
 			t.Fatal("defrag was not called within 2s — Run did not invoke check on tick")
 		default:
-			if m.defragCalled {
+			if m.defragCalled.Load() {
 				cancel()
 				<-done
 				return
@@ -401,7 +402,7 @@ func TestHandler_UnknownAlarmType(t *testing.T) {
 	if err := h.check(context.Background()); err != nil {
 		t.Fatalf("unexpected error for unknown alarm type: %v", err)
 	}
-	if m.defragCalled {
+	if m.defragCalled.Load() {
 		t.Error("defrag should not be called for unknown alarm type")
 	}
 	if len(m.disarmed) != 0 {

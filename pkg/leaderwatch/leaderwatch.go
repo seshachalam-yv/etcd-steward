@@ -13,7 +13,9 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/api/resource"
 
+	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/metrics"
 	"github.com/gardener/etcd-steward/pkg/statemachine"
 )
@@ -46,6 +48,8 @@ type LeaderWatcher struct {
 	mu          sync.RWMutex
 	currentRole Role
 	wasLeader   *bool
+	dbSize      int64 // last observed DbSize in bytes (0 = not yet polled)
+	dbSizeInUse int64 // last observed DbSizeInUse in bytes
 }
 
 // New creates a LeaderWatcher with the provided dependencies.
@@ -88,12 +92,13 @@ func (w *LeaderWatcher) Run(ctx context.Context, endpoint string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			isLeader, err := w.checkLeadership(ctx)
+			resp, err := w.checkLeadership(ctx)
 			if err != nil {
 				w.logger.Warn("failed to check leadership status", zap.Error(err))
 				metrics.ComponentHealth.WithLabelValues(w.memberNamespace, w.memberName, "leaderwatch").Set(0)
 				continue
 			}
+			isLeader := resp.Header.MemberId == resp.Leader
 
 			metrics.ComponentHealth.WithLabelValues(w.memberNamespace, w.memberName, "leaderwatch").Set(1)
 
@@ -103,6 +108,8 @@ func (w *LeaderWatcher) Run(ctx context.Context, endpoint string) {
 			} else {
 				w.currentRole = RoleMember
 			}
+			w.dbSize = resp.DbSize
+			w.dbSizeInUse = resp.DbSizeInUse
 			w.mu.Unlock()
 
 			if w.wasLeader == nil {
@@ -135,11 +142,31 @@ func (w *LeaderWatcher) Run(ctx context.Context, endpoint string) {
 	}
 }
 
-// checkLeadership queries the etcd status endpoint and returns whether this member is the leader.
-func (w *LeaderWatcher) checkLeadership(ctx context.Context) (bool, error) {
+// checkLeadership queries the etcd status endpoint and returns the full status response.
+func (w *LeaderWatcher) checkLeadership(ctx context.Context) (*clientv3.StatusResponse, error) {
 	resp, err := w.statusAPI.Status(ctx, w.endpoint)
 	if err != nil {
-		return false, fmt.Errorf("status call failed: %w", err)
+		return nil, fmt.Errorf("status call failed: %w", err)
 	}
-	return resp.Header.MemberId == resp.Leader, nil
+	return resp, nil
+}
+
+// ProvideInfo implements member.InfoProvider.
+// Returns the latest DB size values observed from etcd status polling.
+// Safe to call concurrently with Run.
+func (w *LeaderWatcher) ProvideInfo() member.StatusInfo {
+	w.mu.RLock()
+	dbSize := w.dbSize
+	dbSizeInUse := w.dbSizeInUse
+	w.mu.RUnlock()
+
+	if dbSize == 0 && dbSizeInUse == 0 {
+		return member.StatusInfo{}
+	}
+	dbSizeQty := resource.NewMilliQuantity(dbSize*1000, resource.BinarySI)
+	dbSizeInUseQty := resource.NewMilliQuantity(dbSizeInUse*1000, resource.BinarySI)
+	return member.StatusInfo{
+		DBSize:      dbSizeQty,
+		DBSizeInUse: dbSizeInUseQty,
+	}
 }

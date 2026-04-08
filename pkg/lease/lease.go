@@ -30,6 +30,12 @@ type Renewer struct {
 	client            coordinationv1client.LeasesGetter
 	stateFunc         StateFunc
 	logger            *zap.Logger
+
+	// cachedMemberID and cachedClusterID hold the last successfully obtained
+	// member and cluster IDs. They are used to avoid overwriting a valid lease
+	// identity with empty values when etcd is temporarily unreachable.
+	cachedMemberID  string
+	cachedClusterID string
 }
 
 // New creates a new Renewer.
@@ -77,7 +83,20 @@ func (r *Renewer) Run(ctx context.Context) {
 // renew performs a single lease renewal, creating the lease if it does not exist.
 func (r *Renewer) renew(ctx context.Context) error {
 	memberID, clusterID, role := r.stateFunc()
-	holderIdentity := fmt.Sprintf("%s:%s:%s", memberID, clusterID, role)
+
+	// Cache the member and cluster IDs once we obtain valid (non-empty) values.
+	// This prevents overwriting a previously valid lease identity with empty strings
+	// when etcd is temporarily unreachable between heartbeat ticks.
+	if memberID != "" {
+		r.cachedMemberID = memberID
+	}
+	if clusterID != "" {
+		r.cachedClusterID = clusterID
+	}
+	effectiveMemberID := r.cachedMemberID
+	effectiveClusterID := r.cachedClusterID
+
+	holderIdentity := fmt.Sprintf("%s:%s:%s", effectiveMemberID, effectiveClusterID, role)
 
 	now := metav1.NewMicroTime(time.Now())
 	leaseClient := r.client.Leases(r.namespace)

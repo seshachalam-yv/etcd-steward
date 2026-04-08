@@ -223,6 +223,62 @@ func TestHolderIdentityFormat(t *testing.T) {
 	}
 }
 
+func TestRenewCachesIDsAndAvoidsMemberOnlyIdentity(t *testing.T) {
+	// Simulate the real scenario:
+	// - First call: memberID and clusterID are empty (etcd not yet ready)
+	// - Second call: memberID and clusterID populated (etcd is up)
+	// - Third call: empty again (transient etcd unreachable)
+	// Expected: the lease always uses the last valid IDs, never "::Member" after valid IDs seen.
+	callCount := 0
+	stateSeq := []struct{ memberID, clusterID, role string }{
+		{"", "", "Member"},                   // etcd not ready yet
+		{"8e9e05c52164694d", "abc123", "Leader"}, // etcd up, became leader
+		{"", "", "Leader"},                   // transient unreachable
+	}
+	stateFunc := func() (string, string, string) {
+		idx := callCount
+		if idx >= len(stateSeq) {
+			idx = len(stateSeq) - 1
+		}
+		callCount++
+		return stateSeq[idx].memberID, stateSeq[idx].clusterID, stateSeq[idx].role
+	}
+
+	client := &mockLeaseClient{}
+	r := newTestRenewer(client, stateFunc)
+
+	// First renewal: empty IDs — should still write "::Member" (no cached value yet)
+	if err := r.renew(context.Background()); err != nil {
+		t.Fatalf("unexpected error on first renew: %v", err)
+	}
+	if client.lease != nil && client.lease.Spec.HolderIdentity != nil {
+		identity := *client.lease.Spec.HolderIdentity
+		if identity != "::Member" {
+			t.Errorf("first renew: expected '::Member' before IDs known, got %q", identity)
+		}
+	}
+
+	// Second renewal: valid IDs — should cache and use them
+	if err := r.renew(context.Background()); err != nil {
+		t.Fatalf("unexpected error on second renew: %v", err)
+	}
+	if client.lease == nil || client.lease.Spec.HolderIdentity == nil {
+		t.Fatal("expected lease to exist after second renew")
+	}
+	if *client.lease.Spec.HolderIdentity != "8e9e05c52164694d:abc123:Leader" {
+		t.Errorf("second renew: expected '8e9e05c52164694d:abc123:Leader', got %q", *client.lease.Spec.HolderIdentity)
+	}
+
+	// Third renewal: empty IDs again — should use cached values
+	if err := r.renew(context.Background()); err != nil {
+		t.Fatalf("unexpected error on third renew: %v", err)
+	}
+	if *client.lease.Spec.HolderIdentity != "8e9e05c52164694d:abc123:Leader" {
+		t.Errorf("third renew (transient empty): expected cached '8e9e05c52164694d:abc123:Leader', got %q",
+			*client.lease.Spec.HolderIdentity)
+	}
+}
+
 func TestRunStopsOnContextCancel(t *testing.T) {
 	client := &mockLeaseClient{}
 	logger, _ := zap.NewDevelopment()

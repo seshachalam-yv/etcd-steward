@@ -69,6 +69,7 @@ type Snapshotter struct {
 
 	mu                   sync.Mutex
 	lastRevision         int64
+	lastFullRevision     int64 // revision of the last full snapshot; delta events at or below this are redundant
 	snapshotInfo         member.SnapshotInfo // tracks latest snapshot metadata for InfoProvider
 	accumulatedDeltaBytes int64              // running total of uncompressed delta sizes
 }
@@ -159,6 +160,7 @@ func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*s
 	uncompressedSize := int64(len(data))
 	s.mu.Lock()
 	s.lastRevision = currentRev
+	s.lastFullRevision = currentRev
 	s.accumulatedDeltaBytes = 0
 	qty := resource.NewMilliQuantity(uncompressedSize*1000, resource.BinarySI)
 	zero := resource.MustParse("0")
@@ -211,11 +213,12 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 
 	wch := s.watchAPI.Watch(watchCtx, "", clientv3.WithPrefix(), clientv3.WithRev(startRev+1))
 
-	var events bytes.Buffer
+	var allEvents []DeltaEvent
 	var lastRev int64
 	eventCount := int64(0)
 	maxDeltaEvents := int64(1_000_000)
 	maxDeltaSize := int64(100 * 1024 * 1024) // 100 MiB
+	var rawSize int64
 
 	for watchResp := range wch {
 		if watchResp.Err() != nil {
@@ -236,25 +239,46 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 				ModRevision: ev.Kv.ModRevision,
 				Version:     ev.Kv.Version,
 			}
-			line, err := MarshalDeltaEvent(de)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal delta event: %w", err)
-			}
-			events.Write(line)
-			events.WriteByte('\n')
+			allEvents = append(allEvents, de)
 			if ev.Kv.ModRevision > lastRev {
 				lastRev = ev.Kv.ModRevision
 			}
 			eventCount++
+			rawSize += int64(len(ev.Kv.Key) + len(ev.Kv.Value))
 		}
 
-		if eventCount >= maxDeltaEvents || int64(events.Len()) >= maxDeltaSize {
+		if eventCount >= maxDeltaEvents || rawSize >= maxDeltaSize {
 			break
 		}
 	}
 
-	if eventCount == 0 {
-		return nil, nil // No events to snapshot.
+	// Re-read lastFullRevision under lock. A concurrent TriggerFullSnapshot may have
+	// advanced it while the watch was running. Discard events already covered by the
+	// newer full snapshot so the delta's startRevision is correct.
+	s.mu.Lock()
+	effectiveStartRev := s.lastFullRevision
+	s.mu.Unlock()
+	if effectiveStartRev < startRev {
+		effectiveStartRev = startRev
+	}
+
+	var events bytes.Buffer
+	var filteredCount int64
+	for _, de := range allEvents {
+		if de.ModRevision <= effectiveStartRev {
+			continue // already covered by a full snapshot
+		}
+		line, err := MarshalDeltaEvent(de)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal delta event: %w", err)
+		}
+		events.Write(line)
+		events.WriteByte('\n')
+		filteredCount++
+	}
+
+	if filteredCount == 0 {
+		return nil, nil // No events to snapshot beyond what full snapshots cover.
 	}
 
 	// Compress the collected events.
@@ -273,7 +297,7 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	now := time.Now().UTC()
 	snap := snapstore.Snapshot{
 		Kind:          "Incremental",
-		StartRevision: startRev,
+		StartRevision: effectiveStartRev,
 		LastRevision:  lastRev,
 		CreatedOn:     now,
 		SnapDir:       fmt.Sprintf("Backup-%d", now.Unix()),
@@ -293,7 +317,7 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	s.snapshotInfo.LastDelta = &member.SnapshotEntry{
 		Name:          snap.SnapName,
 		Timestamp:     metav1.NewTime(now),
-		StartRevision: startRev,
+		StartRevision: effectiveStartRev,
 		EndRevision:   lastRev,
 		Size:          deltaQty,
 	}
@@ -304,9 +328,9 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	metrics.SnapshotDurationSeconds.WithLabelValues("delta").Observe(duration)
 
 	s.logger.Info("delta snapshot saved",
-		zap.Int64("startRevision", startRev),
+		zap.Int64("startRevision", effectiveStartRev),
 		zap.Int64("lastRevision", lastRev),
-		zap.Int64("events", eventCount),
+		zap.Int64("events", filteredCount),
 		zap.String("path", snap.Path()),
 		zap.Float64("durationSeconds", duration),
 	)

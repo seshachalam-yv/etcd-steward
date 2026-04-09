@@ -521,3 +521,90 @@ func TestProvideInfo_FullAfterDelta_ResetsAccumulation(t *testing.T) {
 			info.Snapshots.AccumulatedDeltaSize)
 	}
 }
+
+// TestTriggerDeltaSnapshot_FiltersEventsAlreadyCoveredByFullSnapshot verifies that
+// if TriggerFullSnapshot is called between the start and end of a TriggerDeltaSnapshot
+// watch, events already covered by the new full snapshot are filtered out of the delta.
+// This prevents the delta's StartRevision from being lower than the latest full snapshot.
+func TestTriggerDeltaSnapshot_FiltersEventsAlreadyCoveredByFullSnapshot(t *testing.T) {
+	store := &mockSnapstore{}
+
+	// Events from rev 43..46 — but a full snapshot at rev 44 will be "taken" mid-watch.
+	events := []*clientv3.Event{
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k1"), Value: []byte("v1"), ModRevision: 43}},
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k2"), Value: []byte("v2"), ModRevision: 44}},
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k3"), Value: []byte("v3"), ModRevision: 45}},
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k4"), Value: []byte("v4"), ModRevision: 46}},
+	}
+
+	s := New(
+		store,
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{events: events},
+		&fakeStatusAPI{revision: 44},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	// Simulate: last full snapshot was at rev 42; then a new full snapshot was taken at rev 44
+	// (concurrent with the delta watch starting at startRev=42).
+	s.lastRevision = 42
+	s.lastFullRevision = 44 // full snapshot at 44 happened concurrently
+
+	snap, err := s.TriggerDeltaSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("TriggerDeltaSnapshot error: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("expected non-nil snapshot (events 45,46 are beyond fullRev=44)")
+	}
+
+	// StartRevision must reflect the latest full snapshot, not the old lastRevision.
+	if snap.StartRevision != 44 {
+		t.Errorf("StartRevision = %d, want 44 (latest full snapshot rev)", snap.StartRevision)
+	}
+	if snap.LastRevision != 46 {
+		t.Errorf("LastRevision = %d, want 46", snap.LastRevision)
+	}
+
+	// Verify lastRevision advanced to 46.
+	s.mu.Lock()
+	gotLastRev := s.lastRevision
+	s.mu.Unlock()
+	if gotLastRev != 46 {
+		t.Errorf("s.lastRevision = %d, want 46", gotLastRev)
+	}
+}
+
+// TestTriggerDeltaSnapshot_AllEventsFilteredByFullSnapshot verifies that if ALL watched
+// events are already covered by a concurrent full snapshot, TriggerDeltaSnapshot returns nil.
+func TestTriggerDeltaSnapshot_AllEventsFilteredByFullSnapshot(t *testing.T) {
+	events := []*clientv3.Event{
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k1"), Value: []byte("v1"), ModRevision: 43}},
+		{Type: clientv3.EventTypePut, Kv: &mvccpb.KeyValue{Key: []byte("k2"), Value: []byte("v2"), ModRevision: 44}},
+	}
+
+	s := New(
+		&mockSnapstore{},
+		&noopCompressor{},
+		"etcd-main", "default",
+		&fakeSnapshotAPI{data: []byte("data")},
+		&fakeWatchAPI{events: events},
+		&fakeStatusAPI{revision: 45},
+		func() bool { return true },
+		zap.NewNop(),
+	)
+
+	s.lastRevision = 42
+	s.lastFullRevision = 45 // full snapshot at 45 covers all watched events (43,44)
+
+	snap, err := s.TriggerDeltaSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if snap != nil {
+		t.Errorf("expected nil snapshot (all events covered by full at rev 45), got %+v", snap)
+	}
+}

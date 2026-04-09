@@ -15,6 +15,7 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -221,14 +222,27 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 			break
 		}
 		for _, ev := range watchResp.Events {
-			// Simple serialization: write the key-value as length-prefixed bytes.
-			if ev.Kv != nil {
-				events.Write(ev.Kv.Key)
-				events.WriteByte('\n')
-				events.Write(ev.Kv.Value)
-				events.WriteByte('\n')
+			if ev.Kv == nil {
+				continue
 			}
-			if ev.Kv != nil && ev.Kv.ModRevision > lastRev {
+			evType := EventTypePut
+			if ev.Type == mvccpb.DELETE {
+				evType = EventTypeDelete
+			}
+			de := DeltaEvent{
+				Type:        evType,
+				Key:         ev.Kv.Key,
+				Value:       ev.Kv.Value,
+				ModRevision: ev.Kv.ModRevision,
+				Version:     ev.Kv.Version,
+			}
+			line, err := MarshalDeltaEvent(de)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal delta event: %w", err)
+			}
+			events.Write(line)
+			events.WriteByte('\n')
+			if ev.Kv.ModRevision > lastRev {
 				lastRev = ev.Kv.ModRevision
 			}
 			eventCount++

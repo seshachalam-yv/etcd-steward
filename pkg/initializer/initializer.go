@@ -249,6 +249,13 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 	}
 
 	result := validator.Validate(i.dataDir, valMode)
+	i.logger.Info("DB validation result",
+		zap.String("mode", mode),
+		zap.Bool("valid", result.Valid),
+		zap.Bool("isSingleNode", i.isSingleNode),
+		zap.Bool("isDataDirEmpty", i.isDataDirEmpty()),
+		zap.Bool("storeConfigured", i.store != nil),
+	)
 	if result.Valid {
 		// Single-node: if the data directory is empty and a snapstore is configured,
 		// attempt restoration from the latest snapshot before proceeding. This handles

@@ -163,6 +163,16 @@ func main() {
 		cfg.EnableMemberLeaseRenewal = enableLease
 	}
 
+	// Configure compression policy: only override default when compress-snapshots is true
+	// and a compression-policy flag was explicitly provided.
+	if compressEnabled, err := fs.GetBool("compress-snapshots"); err == nil && compressEnabled {
+		if policy, err := fs.GetString("compression-policy"); err == nil && policy != "" {
+			cfg.CompressionPolicy = policy
+		}
+	} else if !compressEnabled {
+		cfg.CompressionPolicy = "none"
+	}
+
 	// Capture listen URLs for etcd config YAML.
 	capturedListenPeerURLs := *listenPeerURLs
 	capturedListenClientURLs := *listenClientURLs

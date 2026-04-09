@@ -7,6 +7,7 @@ package restoration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,10 +15,19 @@ import (
 	"path/filepath"
 	"testing"
 
+	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
 
+	"github.com/gardener/etcd-steward/pkg/snapshotter"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
 )
+
+// TestMain enables skipHashCheck so unit tests can use fake bbolt DBs as snapshot
+// content without requiring a valid etcd snapshot hash.
+func TestMain(m *testing.M) {
+	skipHashCheck = true
+	os.Exit(m.Run())
+}
 
 // mockSnapstore implements snapstore.Snapstore for testing.
 type mockSnapstore struct {
@@ -54,11 +64,84 @@ type nopWriteCloser struct{ w io.Writer }
 func (n *nopWriteCloser) Write(p []byte) (int, error) { return n.w.Write(p) }
 func (n *nopWriteCloser) Close() error                { return nil }
 
+// makeFakeEtcdDB creates a minimal bbolt DB file with the "key" and "meta" buckets
+// that etcd restoration expects. Returns the path to the DB file.
+func makeFakeEtcdDB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("failed to create test bbolt DB: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		if _, err := tx.CreateBucket(keyBucketName); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(metaBucketName)
+		return err
+	}); err != nil {
+		t.Fatalf("failed to create buckets in test DB: %v", err)
+	}
+
+	return dbPath
+}
+
+// readFakeEtcdDB reads the "key" bucket and returns all entries as a slice of KV pairs.
+// Used to verify delta replay results.
+func readFakeEtcdDBKeys(t *testing.T, dbPath string) map[int64][]byte {
+	t.Helper()
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("failed to open test bbolt DB: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	result := make(map[int64][]byte)
+	if err := db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(keyBucketName)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			// key is {8-byte big-endian mainRev}'_'{8-byte big-endian subRev}; extract mainRev
+			if len(k) >= 17 {
+				mainRev := int64(k[0])<<56 | int64(k[1])<<48 | int64(k[2])<<40 | int64(k[3])<<32 |
+					int64(k[4])<<24 | int64(k[5])<<16 | int64(k[6])<<8 | int64(k[7])
+				cp := make([]byte, len(v))
+				copy(cp, v)
+				result[mainRev] = cp
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("failed to read test bbolt DB: %v", err)
+	}
+	return result
+}
+
+// makeDeltaPayload serializes a slice of DeltaEvents as NDJSON bytes (as the snapshotter writes).
+func makeDeltaPayload(events []snapshotter.DeltaEvent) []byte {
+	var buf bytes.Buffer
+	for _, ev := range events {
+		line, _ := json.Marshal(ev)
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	return buf.Bytes()
+}
+
 func TestRestore_Success(t *testing.T) {
 	dataDir := t.TempDir()
 	tempDir := t.TempDir()
 
-	dbContent := []byte("fake-etcd-db-content")
+	dbContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
 
 	store := &mockSnapstore{
 		snaps: []snapstore.Snapshot{
@@ -75,7 +158,7 @@ func TestRestore_Success(t *testing.T) {
 		},
 	}
 
-	err := Restore(
+	err = Restore(
 		context.Background(),
 		store,
 		&noopCompressor{},
@@ -92,12 +175,8 @@ func TestRestore_Success(t *testing.T) {
 
 	// Verify the DB was written to the correct location.
 	dbPath := filepath.Join(dataDir, "member", "snap", "db")
-	data, err := os.ReadFile(dbPath)
-	if err != nil {
-		t.Fatalf("failed to read restored DB: %v", err)
-	}
-	if !bytes.Equal(data, dbContent) {
-		t.Errorf("restored DB content mismatch: got %q, want %q", data, dbContent)
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		t.Fatal("expected restored DB file to exist")
 	}
 }
 
@@ -153,11 +232,25 @@ func TestRestore_EmptyStore(t *testing.T) {
 	}
 }
 
+// TestRestore_WithDeltas verifies that delta events are applied to the restored DB.
+// After restore, the bbolt "key" bucket should contain entries for both the full
+// snapshot and the delta events.
 func TestRestore_WithDeltas(t *testing.T) {
 	dataDir := t.TempDir()
 	tempDir := t.TempDir()
 
-	dbContent := []byte("fake-etcd-db-content-with-deltas")
+	// Create a valid bbolt DB as the "full snapshot" content.
+	fullDBContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
+
+	// Create delta events: one PUT at rev 101, one DELETE at rev 102.
+	deltaEvents := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/foo"), Value: []byte("bar"), ModRevision: 101, Version: 1},
+		{Type: snapshotter.EventTypeDelete, Key: []byte("/baz"), ModRevision: 102, Version: 0},
+	}
+	deltaPayload := makeDeltaPayload(deltaEvents)
 
 	store := &mockSnapstore{
 		snaps: []snapstore.Snapshot{
@@ -171,18 +264,18 @@ func TestRestore_WithDeltas(t *testing.T) {
 			{
 				Kind:          "Incremental",
 				StartRevision: 100,
-				LastRevision:  200,
+				LastRevision:  102,
 				SnapDir:       "backups",
-				SnapName:      "Incremental-0000000000000100-0000000000000200-200000000000",
+				SnapName:      "Incremental-0000000000000100-0000000000000102-200000000000",
 			},
 		},
 		data: map[string][]byte{
-			"backups/Full-0000000000000000-0000000000000100-100000000000": dbContent,
+			"backups/Full-0000000000000000-0000000000000100-100000000000":              fullDBContent,
+			"backups/Incremental-0000000000000100-0000000000000102-200000000000": deltaPayload,
 		},
 	}
 
-	// Deltas are found but skipped (stubbed). No error expected.
-	err := Restore(
+	err = Restore(
 		context.Background(),
 		store,
 		&noopCompressor{},
@@ -198,8 +291,99 @@ func TestRestore_WithDeltas(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(dataDir, "member", "snap", "db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		t.Fatal("expected restored DB file to exist")
+	entries := readFakeEtcdDBKeys(t, dbPath)
+
+	// Both delta events must be present (rev 101 and 102).
+	if _, ok := entries[101]; !ok {
+		t.Error("expected entry at revision 101 (PUT /foo) to be present in restored DB")
+	}
+	if _, ok := entries[102]; !ok {
+		t.Error("expected entry at revision 102 (DELETE /baz) to be present in restored DB")
+	}
+}
+
+// TestRestore_WithDeltas_MultipleSnapshots verifies that multiple delta snapshots
+// are applied in order.
+func TestRestore_WithDeltas_MultipleSnapshots(t *testing.T) {
+	dataDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fullDBContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
+
+	delta1 := makeDeltaPayload([]snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/a"), Value: []byte("1"), ModRevision: 101, Version: 1},
+	})
+	delta2 := makeDeltaPayload([]snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/b"), Value: []byte("2"), ModRevision: 201, Version: 1},
+		{Type: snapshotter.EventTypeDelete, Key: []byte("/a"), ModRevision: 202, Version: 0},
+	})
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			{Kind: "Full", StartRevision: 0, LastRevision: 100, SnapDir: "b", SnapName: "Full-0-100-1"},
+			{Kind: "Incremental", StartRevision: 100, LastRevision: 101, SnapDir: "b", SnapName: "Incremental-100-101-2"},
+			{Kind: "Incremental", StartRevision: 101, LastRevision: 202, SnapDir: "b", SnapName: "Incremental-101-202-3"},
+		},
+		data: map[string][]byte{
+			"b/Full-0-100-1":              fullDBContent,
+			"b/Incremental-100-101-2": delta1,
+			"b/Incremental-101-202-3": delta2,
+		},
+	}
+
+	if err := Restore(context.Background(), store, &noopCompressor{}, dataDir, tempDir,
+		"etcd-main-0", "https://etcd-main-0:2380", "etcd-main-0=https://etcd-main-0:2380",
+		zap.NewNop()); err != nil {
+		t.Fatalf("Restore error: %v", err)
+	}
+
+	entries := readFakeEtcdDBKeys(t, filepath.Join(dataDir, "member", "snap", "db"))
+	for _, rev := range []int64{101, 201, 202} {
+		if _, ok := entries[rev]; !ok {
+			t.Errorf("expected entry at revision %d to be present", rev)
+		}
+	}
+}
+
+// TestRestore_DeltaOnlyAfterFull verifies that delta snapshots with StartRevision
+// BEFORE the full snapshot are ignored.
+func TestRestore_DeltaOnlyAfterFull(t *testing.T) {
+	dataDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	fullDBContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
+
+	oldDelta := makeDeltaPayload([]snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/stale"), Value: []byte("x"), ModRevision: 50, Version: 1},
+	})
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			// delta at rev 50 is BEFORE the full snapshot at rev 100 — must be skipped.
+			{Kind: "Incremental", StartRevision: 30, LastRevision: 50, SnapDir: "b", SnapName: "Incremental-30-50-1"},
+			{Kind: "Full", StartRevision: 0, LastRevision: 100, SnapDir: "b", SnapName: "Full-0-100-2"},
+		},
+		data: map[string][]byte{
+			"b/Full-0-100-2":          fullDBContent,
+			"b/Incremental-30-50-1": oldDelta,
+		},
+	}
+
+	if err := Restore(context.Background(), store, &noopCompressor{}, dataDir, tempDir,
+		"etcd-main-0", "https://etcd-main-0:2380", "etcd-main-0=https://etcd-main-0:2380",
+		zap.NewNop()); err != nil {
+		t.Fatalf("Restore error: %v", err)
+	}
+
+	entries := readFakeEtcdDBKeys(t, filepath.Join(dataDir, "member", "snap", "db"))
+	if _, ok := entries[50]; ok {
+		t.Error("stale delta at revision 50 should NOT have been applied (it predates the full snapshot)")
 	}
 }
 
@@ -417,5 +601,103 @@ func TestRestore_WriteTempDBError(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected error from io.Copy during write, got nil")
+	}
+}
+
+// TestWriteDeltaEventsToDB verifies PUT and DELETE events are correctly persisted.
+func TestWriteDeltaEventsToDB(t *testing.T) {
+	dbPath := makeFakeEtcdDB(t)
+
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+
+	events := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/k1"), Value: []byte("v1"), ModRevision: 10, Version: 1},
+		{Type: snapshotter.EventTypeDelete, Key: []byte("/k2"), ModRevision: 11, Version: 0},
+	}
+
+	lastRev, err := writeDeltaEventsToDB(db, events)
+	db.Close() //nolint:errcheck
+	if err != nil {
+		t.Fatalf("writeDeltaEventsToDB error: %v", err)
+	}
+	if lastRev != 11 {
+		t.Errorf("lastRev = %d, want 11", lastRev)
+	}
+
+	entries := readFakeEtcdDBKeys(t, dbPath)
+	if _, ok := entries[10]; !ok {
+		t.Error("rev 10 (PUT /k1) not found in DB")
+	}
+	if _, ok := entries[11]; !ok {
+		t.Error("rev 11 (DELETE /k2) not found in DB")
+	}
+}
+
+// TestWriteDeltaEventsToDB_EmptyEvents returns 0 and no error for empty input.
+func TestWriteDeltaEventsToDB_EmptyEvents(t *testing.T) {
+	dbPath := makeFakeEtcdDB(t)
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	lastRev, err := writeDeltaEventsToDB(db, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if lastRev != 0 {
+		t.Errorf("lastRev = %d, want 0", lastRev)
+	}
+}
+
+// TestEncodeRevision verifies that encoded revisions sort correctly (big-endian).
+func TestEncodeRevision(t *testing.T) {
+	r1 := encodeRevision(1, 0)
+	r2 := encodeRevision(2, 0)
+	r100 := encodeRevision(100, 0)
+
+	if bytes.Compare(r1, r2) >= 0 {
+		t.Error("rev(1) should be less than rev(2)")
+	}
+	if bytes.Compare(r2, r100) >= 0 {
+		t.Error("rev(2) should be less than rev(100)")
+	}
+	if len(r1) != 17 {
+		t.Errorf("revision key length = %d, want 17", len(r1))
+	}
+}
+
+// TestReadDeltaEvents verifies that readDeltaEvents correctly deserializes events.
+func TestReadDeltaEvents(t *testing.T) {
+	events := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/a"), Value: []byte("1"), ModRevision: 5, Version: 1},
+		{Type: snapshotter.EventTypeDelete, Key: []byte("/b"), ModRevision: 6, Version: 0},
+	}
+	payload := makeDeltaPayload(events)
+
+	store := &mockSnapstore{
+		snaps: nil,
+		data: map[string][]byte{
+			"b/snap": payload,
+		},
+	}
+	snap := snapstore.Snapshot{SnapDir: "b", SnapName: "snap"}
+
+	got, err := readDeltaEvents(store, &noopCompressor{}, snap)
+	if err != nil {
+		t.Fatalf("readDeltaEvents error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2", len(got))
+	}
+	if got[0].ModRevision != 5 || string(got[0].Key) != "/a" {
+		t.Errorf("event[0] mismatch: %+v", got[0])
+	}
+	if got[1].Type != snapshotter.EventTypeDelete || got[1].ModRevision != 6 {
+		t.Errorf("event[1] mismatch: %+v", got[1])
 	}
 }

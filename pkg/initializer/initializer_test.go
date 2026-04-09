@@ -15,14 +15,23 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
 
 	"github.com/gardener/etcd-steward/pkg/compression"
 	"github.com/gardener/etcd-steward/pkg/etcdclient"
 	"github.com/gardener/etcd-steward/pkg/member"
+	"github.com/gardener/etcd-steward/pkg/restoration"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
 	"github.com/gardener/etcd-steward/pkg/statemachine"
 )
+
+// TestMain enables skipHashCheck in the restoration package so initializer tests
+// can use synthetic snapshot data without requiring a valid etcd snapshot hash.
+func TestMain(m *testing.M) {
+	restoration.SetSkipHashCheckForTests(true)
+	os.Exit(m.Run())
+}
 
 // mockRecorder records transitions for verification.
 type mockRecorder struct {
@@ -611,6 +620,36 @@ func (m *mockSnapstore) List() ([]snapstore.Snapshot, error) {
 }
 func (m *mockSnapstore) Delete(_ snapstore.Snapshot) error { return nil }
 
+// makeMinimalEtcdSnapshotBytes creates a minimal bbolt DB with "key" and "meta" buckets,
+// as expected by etcdutl snapshot restore. Returns the raw file bytes.
+func makeMinimalEtcdSnapshotBytes(t *testing.T) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "snapshot.db")
+
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("failed to create minimal etcd snapshot DB: %v", err)
+	}
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte("key")); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists([]byte("meta"))
+		return err
+	}); err != nil {
+		db.Close() //nolint:errcheck
+		t.Fatalf("failed to create buckets in snapshot DB: %v", err)
+	}
+	db.Close() //nolint:errcheck
+
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("failed to read snapshot DB: %v", err)
+	}
+	return data
+}
+
 // TestTryRestore_NilStore verifies that tryRestore returns nil when no store is configured.
 func TestTryRestore_NilStore(t *testing.T) {
 	dataDir := t.TempDir()
@@ -774,9 +813,9 @@ func TestPromoteLearner_AllAttemptsFail_ContextCancelledDuringBackoff(t *testing
 func TestInitializer_SingleNode_EmptyDataDir_WithSnapshots(t *testing.T) {
 	dataDir := t.TempDir()
 
-	// Simulate a snapshot in the store: minimal valid content (restoration.Restore
-	// will write it to dataDir/member/snap/db).
-	fakeDBContent := []byte("fake-etcd-db-content")
+	// Simulate a snapshot in the store: a minimal valid bbolt DB with the "key" and "meta"
+	// buckets that etcdutl snapshot restore requires.
+	fakeDBContent := makeMinimalEtcdSnapshotBytes(t)
 	fullSnap := snapstore.Snapshot{
 		Kind:          "Full",
 		StartRevision: 0,

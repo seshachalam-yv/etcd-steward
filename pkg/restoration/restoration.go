@@ -303,16 +303,25 @@ func readDeltaEvents(
 	return events, nil
 }
 
+// markTombstone is the byte appended to a 17-byte revision key to signal a DELETE tombstone.
+// Must match go.etcd.io/etcd/server/v3/mvcc.markTombstone.
+const markTombstone byte = 't'
+
 // writeDeltaEventsToDB writes PUT and DELETE events directly into the etcd bbolt MVCC keyspace.
 // Returns the highest revision written, or 0 if no events.
 //
 // etcd's bbolt MVCC layout (stable across 3.5.x):
-//   - Bucket "key": revision_key(mainRev, subRev) → protobuf(mvccpb.KeyValue)
-//     revision_key = big-endian uint64(mainRev) + '_' + big-endian uint64(subRev) (17 bytes)
+//   - Bucket "key": revision_key → protobuf(mvccpb.KeyValue)
+//     PUT key:    17 bytes — big-endian uint64(mainRev) + '_' + big-endian uint64(subRev)
+//     DELETE key: 18 bytes — same 17 bytes + 't' (tombstone marker)
 //   - Bucket "meta": "finishedCompact" → big-endian int64 (last compacted revision)
 //
-// The in-memory B-tree index is rebuilt from the "key" bucket on etcd startup,
-// so we only need to write to "key" (and optionally update "meta").
+// On etcd startup, the in-memory B-tree index is rebuilt by scanning the "key" bucket.
+// Entries with the 't' tombstone suffix are tombstoned in the index (key deleted).
+// Entries without 't' are indexed as live PUT revisions.
+//
+// For PUT events: write a 17-byte key → full KeyValue with CreateRevision, ModRevision, Version, Value.
+// For DELETE events: write an 18-byte key (17 + 't') → minimal KeyValue with Key only.
 func writeDeltaEventsToDB(db *bbolt.DB, events []snapshotter.DeltaEvent) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
@@ -327,20 +336,26 @@ func writeDeltaEventsToDB(db *bbolt.DB, events []snapshotter.DeltaEvent) (int64,
 		}
 
 		for _, ev := range events {
-			kv := &mvccpb.KeyValue{
-				Key:         ev.Key,
-				Value:       ev.Value,
-				ModRevision: ev.ModRevision,
-				Version:     ev.Version,
-			}
-			if ev.Type == snapshotter.EventTypeDelete {
-				// Deletions set Value=nil, Version=0 in etcd MVCC.
-				kv.Value = nil
-				kv.Version = 0
-			}
+			var revKey []byte
+			var kv *mvccpb.KeyValue
 
-			// Encode revision as big-endian uint64 pair (mainRev, subRev=0).
-			revKey := encodeRevision(ev.ModRevision, 0)
+			if ev.Type == snapshotter.EventTypeDelete {
+				// DELETE: 18-byte tombstone key. Value is just the bare key (no revision fields).
+				// etcd rebuilds the B-tree index with ki.tombstone() when it sees the 't' suffix.
+				revKey = append(encodeRevision(ev.ModRevision, 0), markTombstone)
+				kv = &mvccpb.KeyValue{Key: ev.Key}
+			} else {
+				// PUT: 17-byte key. Full KeyValue including CreateRevision so etcd's index
+				// correctly reports the key's creation revision on lookup.
+				revKey = encodeRevision(ev.ModRevision, 0)
+				kv = &mvccpb.KeyValue{
+					Key:            ev.Key,
+					Value:          ev.Value,
+					CreateRevision: ev.CreateRevision,
+					ModRevision:    ev.ModRevision,
+					Version:        ev.Version,
+				}
+			}
 
 			kvBytes, err := kv.Marshal()
 			if err != nil {

@@ -19,11 +19,12 @@ const (
 // DeltaEvent is the unit serialized into incremental snapshot files.
 // One JSON object per line (newline-delimited JSON / NDJSON).
 type DeltaEvent struct {
-	Type        EventType `json:"type"`
-	Key         []byte    `json:"key"`
-	Value       []byte    `json:"value,omitempty"`
-	ModRevision int64     `json:"modRevision"`
-	Version     int64     `json:"version"`
+	Type           EventType `json:"type"`
+	Key            []byte    `json:"key"`
+	Value          []byte    `json:"value,omitempty"`
+	CreateRevision int64     `json:"createRevision,omitempty"`
+	ModRevision    int64     `json:"modRevision"`
+	Version        int64     `json:"version"`
 }
 
 // MarshalDeltaEvent serializes a single DeltaEvent as a JSON line (no trailing newline).

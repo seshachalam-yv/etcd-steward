@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"go.etcd.io/bbolt"
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	"go.uber.org/zap"
 
 	"github.com/gardener/etcd-steward/pkg/snapshotter"
@@ -798,6 +799,125 @@ func TestRestore_FinalRevisionIsLastDeltaRevision(t *testing.T) {
 	}
 	if _, ok := kvs[52]; !ok {
 		t.Error("expected revision 52 in restored DB (from delta), not found")
+	}
+}
+
+// readFakeEtcdDBRaw returns all raw (bbolt key → value) entries from the "key" bucket.
+// Unlike readFakeEtcdDBKeys, it includes tombstone entries (18-byte keys ending in 't').
+func readFakeEtcdDBRaw(t *testing.T, dbPath string) map[string][]byte {
+	t.Helper()
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("failed to open test bbolt DB: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	result := make(map[string][]byte)
+	if err := db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(keyBucketName)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			cp := make([]byte, len(v))
+			copy(cp, v)
+			result[string(k)] = cp
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("failed to read test bbolt DB: %v", err)
+	}
+	return result
+}
+
+// TestWriteDeltaEventsToDB_DeleteWritesTombstone verifies that a DELETE event is written
+// using an 18-byte tombstone key (17-byte revision + 't') rather than a plain 17-byte key.
+// This matches etcd's internal MVCC tombstone format so the B-tree index is correctly rebuilt
+// on startup — without the 't' suffix, etcd treats the entry as a ghost PUT and the deleted
+// key remains visible.
+func TestWriteDeltaEventsToDB_DeleteWritesTombstone(t *testing.T) {
+	dbPath := makeFakeEtcdDB(t)
+
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+
+	events := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/alive"), Value: []byte("yes"), CreateRevision: 10, ModRevision: 10, Version: 1},
+		{Type: snapshotter.EventTypeDelete, Key: []byte("/dead"), ModRevision: 11},
+	}
+
+	_, err = writeDeltaEventsToDB(db, events)
+	db.Close() //nolint:errcheck
+	if err != nil {
+		t.Fatalf("writeDeltaEventsToDB error: %v", err)
+	}
+
+	raw := readFakeEtcdDBRaw(t, dbPath)
+
+	// PUT at rev 10: 17-byte key, no 't' suffix.
+	putKey := string(encodeRevision(10, 0))
+	if _, ok := raw[putKey]; !ok {
+		t.Error("expected 17-byte key entry for PUT at rev 10, not found")
+	}
+	tombKey := putKey + "t" // same revision with 't' appended
+	if _, ok := raw[tombKey]; ok {
+		t.Error("PUT at rev 10 must NOT have a tombstone key (18-byte)")
+	}
+
+	// DELETE at rev 11: 18-byte tombstone key (17 + 't'), NOT a plain 17-byte key.
+	deleteTombKey := string(append(encodeRevision(11, 0), markTombstone))
+	if _, ok := raw[deleteTombKey]; !ok {
+		t.Errorf("expected 18-byte tombstone key for DELETE at rev 11, not found (ghost bug — 't' marker missing)")
+	}
+	deletePlainKey := string(encodeRevision(11, 0))
+	if _, ok := raw[deletePlainKey]; ok {
+		t.Error("DELETE at rev 11 must NOT have a plain 17-byte key (would create ghost on etcd startup)")
+	}
+}
+
+// TestWriteDeltaEventsToDB_PutPreservesCreateRevision verifies that PUT events written to the
+// bbolt DB include the CreateRevision field. Without it, etcd reports create_revision=0 for
+// keys that were only in incremental snapshots (not in the full snapshot).
+func TestWriteDeltaEventsToDB_PutPreservesCreateRevision(t *testing.T) {
+	dbPath := makeFakeEtcdDB(t)
+
+	db, err := bbolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+
+	events := []snapshotter.DeltaEvent{
+		// key created at rev 5, updated at rev 8 — CreateRevision must be 5, not 8.
+		{Type: snapshotter.EventTypePut, Key: []byte("/k"), Value: []byte("v"), CreateRevision: 5, ModRevision: 8, Version: 2},
+	}
+
+	_, err = writeDeltaEventsToDB(db, events)
+	db.Close() //nolint:errcheck
+	if err != nil {
+		t.Fatalf("writeDeltaEventsToDB error: %v", err)
+	}
+
+	raw := readFakeEtcdDBRaw(t, dbPath)
+	revKey := string(encodeRevision(8, 0))
+	kvBytes, ok := raw[revKey]
+	if !ok {
+		t.Fatal("expected entry at rev 8, not found")
+	}
+
+	var kv mvccpb.KeyValue
+	if err := kv.Unmarshal(kvBytes); err != nil {
+		t.Fatalf("unmarshal KeyValue: %v", err)
+	}
+	if kv.CreateRevision != 5 {
+		t.Errorf("CreateRevision = %d, want 5 (key created at rev 5, updated at rev 8)", kv.CreateRevision)
+	}
+	if kv.ModRevision != 8 {
+		t.Errorf("ModRevision = %d, want 8", kv.ModRevision)
+	}
+	if kv.Version != 2 {
+		t.Errorf("Version = %d, want 2", kv.Version)
 	}
 }
 

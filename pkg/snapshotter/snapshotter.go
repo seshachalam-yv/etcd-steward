@@ -233,11 +233,12 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 				evType = EventTypeDelete
 			}
 			de := DeltaEvent{
-				Type:        evType,
-				Key:         ev.Kv.Key,
-				Value:       ev.Kv.Value,
-				ModRevision: ev.Kv.ModRevision,
-				Version:     ev.Kv.Version,
+				Type:           evType,
+				Key:            ev.Kv.Key,
+				Value:          ev.Kv.Value,
+				CreateRevision: ev.Kv.CreateRevision,
+				ModRevision:    ev.Kv.ModRevision,
+				Version:        ev.Kv.Version,
 			}
 			allEvents = append(allEvents, de)
 			if ev.Kv.ModRevision > lastRev {

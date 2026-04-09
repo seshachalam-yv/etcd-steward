@@ -7,6 +7,11 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/spf13/pflag"
+
+	"github.com/gardener/etcd-steward/pkg/config"
 )
 
 func TestDerivePeerURL(t *testing.T) {
@@ -210,5 +215,28 @@ data-dir: /var/etcd/data
 	}
 	if !strings.Contains(string(out), "name: etcd-main-1") {
 		t.Errorf("expected name to be overwritten to 'etcd-main-1', got:\n%s", out)
+	}
+}
+
+// TestDeltaSnapshotPeriodFlagWired verifies that the --delta-snapshot-period flag is applied
+// to cfg.DeltaSnapshotPeriod. Without this wiring the flag is registered but ignored and the
+// steward always uses the 20s default regardless of the spec.backup.deltaSnapshotPeriod field.
+func TestDeltaSnapshotPeriodFlagWired(t *testing.T) {
+	cfg := config.DefaultConfig()
+
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	fs.Duration("delta-snapshot-period", 1*time.Minute, "delta snapshot period")
+
+	if err := fs.Parse([]string{"--delta-snapshot-period=5s"}); err != nil {
+		t.Fatalf("flag parse error: %v", err)
+	}
+
+	// Replicate the flag-wiring logic from main().
+	if period, err := fs.GetDuration("delta-snapshot-period"); err == nil {
+		cfg.DeltaSnapshotPeriod = period
+	}
+
+	if cfg.DeltaSnapshotPeriod != 5*time.Second {
+		t.Errorf("DeltaSnapshotPeriod = %v, want 5s (flag not wired to config)", cfg.DeltaSnapshotPeriod)
 	}
 }

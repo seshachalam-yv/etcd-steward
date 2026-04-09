@@ -163,6 +163,11 @@ func main() {
 		cfg.EnableMemberLeaseRenewal = enableLease
 	}
 
+	// Configure delta-snapshot-period from flag.
+	if period, err := fs.GetDuration("delta-snapshot-period"); err == nil {
+		cfg.DeltaSnapshotPeriod = period
+	}
+
 	// Configure compression policy: only override default when compress-snapshots is true
 	// and a compression-policy flag was explicitly provided.
 	if compressEnabled, err := fs.GetBool("compress-snapshots"); err == nil && compressEnabled {

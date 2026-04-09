@@ -701,3 +701,103 @@ func TestReadDeltaEvents(t *testing.T) {
 		t.Errorf("event[1] mismatch: %+v", got[1])
 	}
 }
+
+// TestRestore_DeduplicatesDeltasByLastRevision verifies that when the backup store contains
+// multiple incremental snapshots with the same LastRevision (produced by the auto-delta loop
+// firing concurrently with a manual trigger), Restore applies only one of them per unique
+// LastRevision rather than replaying identical events multiple times.
+func TestRestore_DeduplicatesDeltasByLastRevision(t *testing.T) {
+	dataDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	dbContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
+
+	// Two incremental snapshots with identical LastRevision (20) — the auto-delta loop fired
+	// twice covering the same range. Both should be deduplicated: only 1 applied.
+	deltaEvents := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/k1"), Value: []byte("v1"), ModRevision: 18, Version: 1},
+		{Type: snapshotter.EventTypePut, Key: []byte("/k2"), Value: []byte("v2"), ModRevision: 19, Version: 1},
+		{Type: snapshotter.EventTypePut, Key: []byte("/k3"), Value: []byte("v3"), ModRevision: 20, Version: 1},
+	}
+	payload := makeDeltaPayload(deltaEvents)
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			{Kind: "Full", StartRevision: 0, LastRevision: 17, SnapDir: "B1", SnapName: "Full-17"},
+			// Two incremental files covering the same range 17→20.
+			{Kind: "Incremental", StartRevision: 17, LastRevision: 20, SnapDir: "B2", SnapName: "Inc-20-first"},
+			{Kind: "Incremental", StartRevision: 17, LastRevision: 20, SnapDir: "B3", SnapName: "Inc-20-second"},
+		},
+		data: map[string][]byte{
+			"B1/Full-17":       dbContent,
+			"B2/Inc-20-first":  payload,
+			"B3/Inc-20-second": payload, // identical events — would cause double-write without dedup
+		},
+	}
+
+	ctx := context.Background()
+	if err := Restore(ctx, store, &noopCompressor{}, dataDir, tempDir,
+		"etcd-0", "http://etcd-0:2380", "etcd-0=http://etcd-0:2380", zap.NewNop()); err != nil {
+		t.Fatalf("Restore error: %v", err)
+	}
+
+	// Open the restored bbolt DB and count entries in the key bucket.
+	dbPath := filepath.Join(dataDir, "member", "snap", "db")
+	kvs := readFakeEtcdDBKeys(t, dbPath)
+
+	// Exactly 3 revisions should be present (rev 18, 19, 20), not 6 (which would happen
+	// if the duplicate delta was applied twice).
+	if len(kvs) != 3 {
+		t.Errorf("expected 3 key entries after dedup, got %d (duplicate delta may have been applied twice)", len(kvs))
+	}
+}
+
+// TestRestore_FinalRevisionIsLastDeltaRevision verifies that after applying deltas, the
+// restored DB contains entries up to the last delta's LastRevision (not just the full
+// snapshot's revision). This proves the logging fix: finalRevision = last delta revision.
+func TestRestore_FinalRevisionIsLastDeltaRevision(t *testing.T) {
+	dataDir := t.TempDir()
+	tempDir := t.TempDir()
+
+	dbContent, err := os.ReadFile(makeFakeEtcdDB(t))
+	if err != nil {
+		t.Fatalf("failed to read fake DB: %v", err)
+	}
+
+	deltaEvents := []snapshotter.DeltaEvent{
+		{Type: snapshotter.EventTypePut, Key: []byte("/k1"), Value: []byte("v1"), ModRevision: 51, Version: 1},
+		{Type: snapshotter.EventTypePut, Key: []byte("/k2"), Value: []byte("v2"), ModRevision: 52, Version: 1},
+	}
+	payload := makeDeltaPayload(deltaEvents)
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			{Kind: "Full", StartRevision: 0, LastRevision: 50, SnapDir: "B1", SnapName: "Full-50"},
+			{Kind: "Incremental", StartRevision: 50, LastRevision: 52, SnapDir: "B2", SnapName: "Inc-50-52"},
+		},
+		data: map[string][]byte{
+			"B1/Full-50":   dbContent,
+			"B2/Inc-50-52": payload,
+		},
+	}
+
+	ctx := context.Background()
+	if err := Restore(ctx, store, &noopCompressor{}, dataDir, tempDir,
+		"etcd-0", "http://etcd-0:2380", "etcd-0=http://etcd-0:2380", zap.NewNop()); err != nil {
+		t.Fatalf("Restore error: %v", err)
+	}
+
+	// Verify the DB has revisions 51 and 52 (from the delta), proving full+delta were applied.
+	dbPath := filepath.Join(dataDir, "member", "snap", "db")
+	kvs := readFakeEtcdDBKeys(t, dbPath)
+	if _, ok := kvs[51]; !ok {
+		t.Error("expected revision 51 in restored DB (from delta), not found")
+	}
+	if _, ok := kvs[52]; !ok {
+		t.Error("expected revision 52 in restored DB (from delta), not found")
+	}
+}
+

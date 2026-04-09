@@ -165,12 +165,21 @@ func Restore(
 	// Find incremental snapshots that cover revisions after the full snapshot.
 	// Include a delta if its LastRevision > latestFull.LastRevision, regardless of
 	// StartRevision — some deltas start before the full snapshot but extend beyond it.
+	// Deduplicate by LastRevision — keep only the latest snapshot for each unique LastRevision
+	// (the auto-delta loop may produce multiple files covering the same range).
 	var deltas []snapstore.Snapshot
+	seenLastRev := make(map[int64]bool)
 	for _, s := range snaps {
 		if s.Kind == "Incremental" && s.LastRevision > latestFull.LastRevision {
-			deltas = append(deltas, s)
+			if !seenLastRev[s.LastRevision] {
+				seenLastRev[s.LastRevision] = true
+				deltas = append(deltas, s)
+			}
 		}
 	}
+
+	// Track the final revision — starts at the full snapshot base and advances as deltas are applied.
+	finalRevision := latestFull.LastRevision
 
 	dbPath := filepath.Join(restoreOut, "member", "snap", "db")
 	if len(deltas) > 0 {
@@ -181,6 +190,8 @@ func Restore(
 		if err := applyDeltas(dbPath, store, compressor, deltas, logger); err != nil {
 			return fmt.Errorf("failed to apply delta snapshots: %w", err)
 		}
+		// The final revision is the LastRevision of the last applied delta.
+		finalRevision = deltas[len(deltas)-1].LastRevision
 	}
 
 	// Move the restored data directory to the target location.
@@ -195,7 +206,9 @@ func Restore(
 
 	logger.Info("restoration completed",
 		zap.String("dataDir", dataDir),
-		zap.Int64("revision", latestFull.LastRevision),
+		zap.Int64("fullSnapshotRevision", latestFull.LastRevision),
+		zap.Int64("finalRevision", finalRevision),
+		zap.Int("deltasApplied", len(deltas)),
 	)
 
 	return nil

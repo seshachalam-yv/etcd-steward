@@ -47,9 +47,9 @@ type ClusterClient interface {
 
 // EtcdClusterClient implements ClusterClient using the etcd client v3 Cluster interface.
 type EtcdClusterClient struct {
-	cluster        clientv3.Cluster
-	initialBackoff time.Duration
-	maxRetries     int
+	cluster           clientv3.Cluster
+	initialBackoff    time.Duration
+	maxRetries        int
 	perAttemptTimeout time.Duration
 }
 

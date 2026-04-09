@@ -123,9 +123,9 @@ func TestLocalSnapstore_Delete(t *testing.T) {
 
 func TestParseSnapshotName_Valid(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantKind string
+		name      string
+		input     string
+		wantKind  string
 		wantStart int64
 		wantLast  int64
 	}{
@@ -278,7 +278,6 @@ func TestLocalSnapstore_List_CompressedFilenames(t *testing.T) {
 		t.Errorf("list[1].Kind = %q, want Incremental", list[1].Kind)
 	}
 }
-
 
 func TestNewSnapstore_Local(t *testing.T) {
 	baseDir := t.TempDir()

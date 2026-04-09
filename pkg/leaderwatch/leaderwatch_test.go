@@ -101,9 +101,9 @@ func TestGainsLeadership(t *testing.T) {
 	const otherID uint64 = 20
 
 	api := &mockStatusAPI{}
-	api.addResponse(memberID, otherID)   // not leader
-	api.addResponse(memberID, memberID)  // became leader
-	api.addResponse(memberID, memberID)  // stay leader
+	api.addResponse(memberID, otherID)  // not leader
+	api.addResponse(memberID, memberID) // became leader
+	api.addResponse(memberID, memberID) // stay leader
 
 	rec := &capturingRecorder{}
 	watcher := newTestWatcher(1*time.Millisecond, api, rec)
@@ -135,9 +135,9 @@ func TestLosesLeadership(t *testing.T) {
 	const otherID uint64 = 20
 
 	api := &mockStatusAPI{}
-	api.addResponse(memberID, memberID)  // is leader
-	api.addResponse(memberID, otherID)   // lost leadership
-	api.addResponse(memberID, otherID)   // stay follower
+	api.addResponse(memberID, memberID) // is leader
+	api.addResponse(memberID, otherID)  // lost leadership
+	api.addResponse(memberID, otherID)  // stay follower
 
 	rec := &capturingRecorder{}
 	watcher := newTestWatcher(1*time.Millisecond, api, rec)
@@ -187,9 +187,9 @@ func TestTransientErrorContinues(t *testing.T) {
 
 	api := &mockStatusAPI{}
 	api.addError(errors.New("connection refused"))
-	api.addResponse(memberID, memberID+1)  // follower
-	api.addResponse(memberID, memberID)    // becomes leader
-	api.addResponse(memberID, memberID)    // stay leader
+	api.addResponse(memberID, memberID+1) // follower
+	api.addResponse(memberID, memberID)   // becomes leader
+	api.addResponse(memberID, memberID)   // stay leader
 
 	rec := &capturingRecorder{}
 	watcher := newTestWatcher(1*time.Millisecond, api, rec)
@@ -269,7 +269,7 @@ func TestProvideInfo_AfterPoll_HasDBSize(t *testing.T) {
 	resp := &clientv3.StatusResponse{}
 	resp.Header = &pb.ResponseHeader{MemberId: memberID}
 	resp.Leader = memberID
-	resp.DbSize = 100 * 1024 * 1024    // 100 MiB
+	resp.DbSize = 100 * 1024 * 1024     // 100 MiB
 	resp.DbSizeInUse = 80 * 1024 * 1024 // 80 MiB
 	api.mu.Lock()
 	api.responses = append(api.responses, resp)

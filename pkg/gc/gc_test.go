@@ -78,13 +78,13 @@ func TestCollect_WithinRetention(t *testing.T) {
 func TestCollect_DeletesOldestSets(t *testing.T) {
 	store := &mockSnapstore{
 		snaps: []snapstore.Snapshot{
-			snap("Full", 0, 100),       // set 0
+			snap("Full", 0, 100),          // set 0
 			snap("Incremental", 100, 150), // set 0
-			snap("Full", 0, 200),       // set 1
+			snap("Full", 0, 200),          // set 1
 			snap("Incremental", 200, 250), // set 1
-			snap("Full", 0, 300),       // set 2
+			snap("Full", 0, 300),          // set 2
 			snap("Incremental", 300, 350), // set 2
-			snap("Full", 0, 400),       // set 3
+			snap("Full", 0, 400),          // set 3
 		},
 	}
 	gc := New(store, 2, zap.NewNop())

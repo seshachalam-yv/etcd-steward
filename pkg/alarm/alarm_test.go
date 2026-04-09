@@ -18,13 +18,13 @@ import (
 
 // fakeMaintenance implements MaintenanceAPI for testing.
 type fakeMaintenance struct {
-	alarms        []*pb.AlarmMember
-	statusRev     int64
-	defragCalled  atomic.Bool
-	disarmed      []*clientv3.AlarmMember
-	alarmListErr  error
-	statusErr     error
-	defragErr     error
+	alarms         []*pb.AlarmMember
+	statusRev      int64
+	defragCalled   atomic.Bool
+	disarmed       []*clientv3.AlarmMember
+	alarmListErr   error
+	statusErr      error
+	defragErr      error
 	alarmDisarmErr error
 }
 

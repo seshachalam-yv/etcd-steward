@@ -60,8 +60,8 @@ type Config struct {
 	EnableRestoration bool `json:"enableRestoration"`
 
 	// Defrag
-	EnableDefrag         bool   `json:"enableDefrag"`
-	DefragSchedule       string `json:"defragSchedule"`
+	EnableDefrag          bool   `json:"enableDefrag"`
+	DefragSchedule        string `json:"defragSchedule"`
 	EnableDistributedLock bool   `json:"enableDistributedLock"`
 
 	// Alarm

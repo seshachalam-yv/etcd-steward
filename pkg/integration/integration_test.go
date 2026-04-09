@@ -375,6 +375,7 @@ func TestMemberStatusReconciler_WithNoopProviders(t *testing.T) {
 		t.Error("reconciler did not stop within 2s")
 	}
 }
+
 // immediately — before initialization begins (etcd-wrapper contract).
 func TestServerReachableBeforeInit(t *testing.T) {
 	dataDir := t.TempDir()

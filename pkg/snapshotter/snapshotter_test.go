@@ -246,17 +246,17 @@ func TestTriggerDeltaSnapshot_Success(t *testing.T) {
 		{
 			Type: clientv3.EventTypePut,
 			Kv: &mvccpb.KeyValue{
-				Key:            []byte("key1"),
-				Value:          []byte("value1"),
-				ModRevision:    43,
+				Key:         []byte("key1"),
+				Value:       []byte("value1"),
+				ModRevision: 43,
 			},
 		},
 		{
 			Type: clientv3.EventTypePut,
 			Kv: &mvccpb.KeyValue{
-				Key:            []byte("key2"),
-				Value:          []byte("value2"),
-				ModRevision:    44,
+				Key:         []byte("key2"),
+				Value:       []byte("value2"),
+				ModRevision: 44,
 			},
 		},
 	}

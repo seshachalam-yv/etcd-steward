@@ -271,7 +271,7 @@ func TestRestore_WithDeltas(t *testing.T) {
 			},
 		},
 		data: map[string][]byte{
-			"backups/Full-0000000000000000-0000000000000100-100000000000":              fullDBContent,
+			"backups/Full-0000000000000000-0000000000000100-100000000000":        fullDBContent,
 			"backups/Incremental-0000000000000100-0000000000000102-200000000000": deltaPayload,
 		},
 	}
@@ -329,7 +329,7 @@ func TestRestore_WithDeltas_MultipleSnapshots(t *testing.T) {
 			{Kind: "Incremental", StartRevision: 101, LastRevision: 202, SnapDir: "b", SnapName: "Incremental-101-202-3"},
 		},
 		data: map[string][]byte{
-			"b/Full-0-100-1":              fullDBContent,
+			"b/Full-0-100-1":          fullDBContent,
 			"b/Incremental-100-101-2": delta1,
 			"b/Incremental-101-202-3": delta2,
 		},
@@ -371,7 +371,7 @@ func TestRestore_DeltaOnlyAfterFull(t *testing.T) {
 			{Kind: "Full", StartRevision: 0, LastRevision: 100, SnapDir: "b", SnapName: "Full-0-100-2"},
 		},
 		data: map[string][]byte{
-			"b/Full-0-100-2":          fullDBContent,
+			"b/Full-0-100-2":        fullDBContent,
 			"b/Incremental-30-50-1": oldDelta,
 		},
 	}
@@ -857,22 +857,19 @@ func TestWriteDeltaEventsToDB_DeleteWritesTombstone(t *testing.T) {
 	raw := readFakeEtcdDBRaw(t, dbPath)
 
 	// PUT at rev 10: 17-byte key, no 't' suffix.
-	putKey := string(encodeRevision(10, 0))
-	if _, ok := raw[putKey]; !ok {
+	if _, ok := raw[string(encodeRevision(10, 0))]; !ok {
 		t.Error("expected 17-byte key entry for PUT at rev 10, not found")
 	}
-	tombKey := putKey + "t" // same revision with 't' appended
-	if _, ok := raw[tombKey]; ok {
+	// Same revision with 't' appended must NOT exist (PUT must not become tombstone).
+	if _, ok := raw[string(encodeRevision(10, 0))+"t"]; ok {
 		t.Error("PUT at rev 10 must NOT have a tombstone key (18-byte)")
 	}
 
 	// DELETE at rev 11: 18-byte tombstone key (17 + 't'), NOT a plain 17-byte key.
-	deleteTombKey := string(append(encodeRevision(11, 0), markTombstone))
-	if _, ok := raw[deleteTombKey]; !ok {
+	if _, ok := raw[string(append(encodeRevision(11, 0), markTombstone))]; !ok {
 		t.Errorf("expected 18-byte tombstone key for DELETE at rev 11, not found (ghost bug — 't' marker missing)")
 	}
-	deletePlainKey := string(encodeRevision(11, 0))
-	if _, ok := raw[deletePlainKey]; ok {
+	if _, ok := raw[string(encodeRevision(11, 0))]; ok {
 		t.Error("DELETE at rev 11 must NOT have a plain 17-byte key (would create ghost on etcd startup)")
 	}
 }
@@ -900,8 +897,7 @@ func TestWriteDeltaEventsToDB_PutPreservesCreateRevision(t *testing.T) {
 	}
 
 	raw := readFakeEtcdDBRaw(t, dbPath)
-	revKey := string(encodeRevision(8, 0))
-	kvBytes, ok := raw[revKey]
+	kvBytes, ok := raw[string(encodeRevision(8, 0))]
 	if !ok {
 		t.Fatal("expected entry at rev 8, not found")
 	}
@@ -920,4 +916,3 @@ func TestWriteDeltaEventsToDB_PutPreservesCreateRevision(t *testing.T) {
 		t.Errorf("Version = %d, want 2", kv.Version)
 	}
 }
-

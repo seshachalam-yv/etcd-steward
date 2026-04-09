@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,11 +67,11 @@ type Snapshotter struct {
 	isLeader    func() bool
 	logger      *zap.Logger
 
-	mu                   sync.Mutex
-	lastRevision         int64
-	lastFullRevision     int64 // revision of the last full snapshot; delta events at or below this are redundant
-	snapshotInfo         member.SnapshotInfo // tracks latest snapshot metadata for InfoProvider
-	accumulatedDeltaBytes int64              // running total of uncompressed delta sizes
+	mu                    sync.Mutex
+	lastRevision          int64
+	lastFullRevision      int64               // revision of the last full snapshot; delta events at or below this are redundant
+	snapshotInfo          member.SnapshotInfo // tracks latest snapshot metadata for InfoProvider
+	accumulatedDeltaBytes int64               // running total of uncompressed delta sizes
 }
 
 // New creates a Snapshotter with the given dependencies.

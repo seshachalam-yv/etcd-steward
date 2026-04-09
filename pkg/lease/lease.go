@@ -11,11 +11,11 @@ import (
 	"strconv"
 	"time"
 
+	"go.uber.org/zap"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
-	"go.uber.org/zap"
 )
 
 // LeaseAnnotationKeyPeerURLTLSEnabled is the annotation key etcd-druid reads from member leases

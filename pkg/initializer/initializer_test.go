@@ -45,14 +45,14 @@ func (r *mockRecorder) Record(_ context.Context, _, _ string, t statemachine.Tra
 
 // mockClusterClient implements etcdclient.ClusterClient for testing.
 type mockClusterClient struct {
-	members          []etcdclient.Member
-	addLearnerID     uint64
-	addLearnerErr    error
-	promotedID       uint64
-	promoteErr       error
-	removedPeerURL   string
-	wasMemberResult  bool
-	wasMemberErr     error
+	members         []etcdclient.Member
+	addLearnerID    uint64
+	addLearnerErr   error
+	promotedID      uint64
+	promoteErr      error
+	removedPeerURL  string
+	wasMemberResult bool
+	wasMemberErr    error
 }
 
 func (m *mockClusterClient) AddLearner(_ context.Context, _ string) (uint64, error) {
@@ -415,11 +415,11 @@ func (m *mockEtcdStatusAPI) Status(_ context.Context, _ string) (*EtcdStatusResp
 // lowercase hexadecimal strings matching the values from the status API response.
 func TestGetMemberAndClusterID(t *testing.T) {
 	tests := []struct {
-		name            string
-		status          InitializationStatus
-		api             EtcdStatusAPI
-		wantMemberID    string
-		wantClusterID   string
+		name          string
+		status        InitializationStatus
+		api           EtcdStatusAPI
+		wantMemberID  string
+		wantClusterID string
 	}{
 		{
 			name:   "not-successful returns empty strings",

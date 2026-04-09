@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,7 +19,6 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	applyconfigurationscoordinationv1 "k8s.io/client-go/applyconfigurations/coordination/v1"
 	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
-	"go.uber.org/zap"
 )
 
 // mockLeasesGetter implements coordinationv1client.LeasesGetter for testing.
@@ -181,25 +181,25 @@ func TestRenewUpdatesExistingLease(t *testing.T) {
 
 func TestHolderIdentityFormat(t *testing.T) {
 	tests := []struct {
-		name     string
-		memberID string
+		name      string
+		memberID  string
 		clusterID string
-		role     string
-		expected string
+		role      string
+		expected  string
 	}{
 		{
-			name:     "leader",
-			memberID: "8e9e05c52164694d",
+			name:      "leader",
+			memberID:  "8e9e05c52164694d",
 			clusterID: "abc123def456",
-			role:     "Leader",
-			expected: "8e9e05c52164694d:abc123def456:Leader",
+			role:      "Leader",
+			expected:  "8e9e05c52164694d:abc123def456:Leader",
 		},
 		{
-			name:     "member",
-			memberID: "deadbeef01234567",
+			name:      "member",
+			memberID:  "deadbeef01234567",
 			clusterID: "cafe0000babe0001",
-			role:     "Member",
-			expected: "deadbeef01234567:cafe0000babe0001:Member",
+			role:      "Member",
+			expected:  "deadbeef01234567:cafe0000babe0001:Member",
 		},
 	}
 
@@ -232,9 +232,9 @@ func TestRenewCachesIDsAndAvoidsMemberOnlyIdentity(t *testing.T) {
 	// Expected: the lease always uses the last valid IDs, never "::Member" after valid IDs seen.
 	callCount := 0
 	stateSeq := []struct{ memberID, clusterID, role string }{
-		{"", "", "Member"},                   // etcd not ready yet
+		{"", "", "Member"},                       // etcd not ready yet
 		{"8e9e05c52164694d", "abc123", "Leader"}, // etcd up, became leader
-		{"", "", "Leader"},                   // transient unreachable
+		{"", "", "Leader"},                       // transient unreachable
 	}
 	stateFunc := func() (string, string, string) {
 		idx := callCount

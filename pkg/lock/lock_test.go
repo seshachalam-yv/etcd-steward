@@ -10,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // fakeEtcdAPI is a mock EtcdAPI for testing.

@@ -779,6 +779,13 @@ func (i *Initializer) tryRestore(ctx context.Context) error {
 		tempDir = i.dataDir + ".restoration.tmp"
 	}
 
+	// Remove any stale temp dir from a previous interrupted restoration attempt.
+	// A crashed restoration can leave a partial tempDir on the PVC, which would
+	// cause the next restoration to fail or pick up incorrect data.
+	if err := os.RemoveAll(tempDir); err != nil {
+		return fmt.Errorf("failed to clear stale restoration temp dir %s: %w", tempDir, err)
+	}
+
 	err := restoration.Restore(
 		ctx,
 		i.store,
@@ -790,6 +797,9 @@ func (i *Initializer) tryRestore(ctx context.Context) error {
 		i.initialCluster,
 		i.logger,
 	)
+	// Always clean up the temp dir — whether restoration succeeded, failed, or found no snapshots.
+	// This ensures stale temp state doesn't accumulate across restarts.
+	_ = os.RemoveAll(tempDir)
 	if errors.Is(err, restoration.ErrNoSnapshotFound) {
 		// No snapshots exist yet — this is a genuinely fresh cluster.
 		// Treat identically to "no store configured": etcd will bootstrap from scratch.

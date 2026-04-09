@@ -899,9 +899,62 @@ func TestInitializer_SingleNode_EmptyDataDir_WithSnapshots(t *testing.T) {
 	}
 }
 
-// TestInitializer_SingleNode_EmptyDataDir_NoSnapshots verifies that when the data directory
-// is empty and no snapshots exist in the store (genuinely fresh cluster), initialization
-// proceeds as a normal fresh start without errors — not treated as a restoration failure.
+// TestTryRestore_ClearsStaleRestorationTempDir verifies that tryRestore removes any stale
+// restoration temp directory left by a previously interrupted restoration attempt.
+// Regression test for: pod crashes during restore, leaving *.restoration.tmp on PVC;
+// next startup must not fail or use the stale partial state.
+func TestTryRestore_ClearsStaleRestorationTempDir(t *testing.T) {
+	base := t.TempDir()
+	// Create paths under the temp dir to simulate PVC layout.
+	actualDataDir := filepath.Join(base, "new.etcd")
+	staleTempDir := actualDataDir + ".restoration.tmp"
+
+	// Simulate a stale temp dir from a previous interrupted restoration.
+	if err := os.MkdirAll(filepath.Join(staleTempDir, "restore-out", "member", "snap"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Put a sentinel file inside to confirm it gets removed.
+	sentinelPath := filepath.Join(staleTempDir, "stale-sentinel.txt")
+	if err := os.WriteFile(sentinelPath, []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up a store with a valid full snapshot.
+	fakeDBContent := makeMinimalEtcdSnapshotBytes(t)
+	snapName := "Full-0000000000000000-0000000000000005-1000.db"
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			{Kind: "Full", StartRevision: 0, LastRevision: 5, SnapDir: "Backup-1", SnapName: snapName},
+		},
+		snapData: map[string][]byte{
+			"Backup-1/" + snapName: fakeDBContent,
+		},
+	}
+	comp, err := compression.NewCompressor("none")
+	if err != nil {
+		t.Fatalf("failed to create compressor: %v", err)
+	}
+
+	init := &Initializer{
+		memberName:     "etcd-main-0",
+		dataDir:        actualDataDir,
+		peerURL:        "https://etcd-main-0:2380",
+		initialCluster: "etcd-main-0=https://etcd-main-0:2380",
+		logger:         zap.NewNop(),
+		store:          store,
+		compressor:     comp,
+	}
+
+	err = init.tryRestore(context.Background())
+	if err != nil {
+		t.Fatalf("tryRestore returned unexpected error: %v", err)
+	}
+
+	// Stale temp dir must be gone.
+	if _, statErr := os.Stat(staleTempDir); statErr == nil {
+		t.Error("stale restoration.tmp dir still exists after tryRestore — expected it to be cleaned up")
+	}
+}
 func TestInitializer_SingleNode_EmptyDataDir_NoSnapshots(t *testing.T) {
 	dataDir := t.TempDir()
 

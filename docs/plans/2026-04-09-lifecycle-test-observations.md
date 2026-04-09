@@ -30,20 +30,34 @@ Both phases completed successfully in a single test run.
 
 ---
 
-## Phase B Results (with TLS — single cycle)
+## Phase B Results (with TLS — complete data loss + restore cycle)
+
+### Setup
+- TLS enabled by patching Etcd resource; druid reconciled and restarted pod with TLS
+- Existing 13 Phase A keys preserved through TLS transition
+- 8 Phase B keys added (5 base + 3 delta), total 21 keys before data loss
 
 ### Steps
 
 | Step | Result |
 |------|--------|
 | Patch Etcd resource with `clientUrlTls`/`peerUrlTls`/`backup.tls` | ✅ druid reconciled, pod restarted with TLS |
-| Verify TLS cluster healthy (get `/lifecycle/phase-a/key1` over HTTPS) | ✅ TLS verified via FQDN `test-client.manual-test.svc.cluster.local:2379` |
-| Write 3 TLS keys (`/lifecycle/phase-b/key{1,2,3}`) | ✅ revision 11–13 (total 11 keys) |
-| Full snapshot at revision 13 | ✅ `Full-...-13-...zst` |
-| Write 2 delta keys (`/lifecycle/phase-b/delta{1,2}`) | ✅ revision 14–15 |
-| Delta snapshot captured | ✅ `Incremental-...-13-...-15-...zst` |
-| Delete PVC, restore from full snapshot at rev 13 | ✅ |
-| Verify 11 keys at revision 13 (all phase-a + phase-b/key{1,2,3}) | ✅ (delta keys NOT restored — known gap) |
+| Verify TLS cluster healthy (get `/lifecycle/a/key1` over HTTPS) | ✅ TLS verified via port-forward + local etcdctl |
+| Write 5 TLS base keys (`/lifecycle/b/key{1..5}`) | ✅ revisions 14–18 |
+| Full snapshot at revision 19 | ✅ `Full-0000000000000000-0000000000000019-...zst` |
+| Write 3 delta keys (`/lifecycle/b/delta{1,2,3}`) | ✅ revisions 20–22 |
+| Delta snapshot captured (rev 19→22) | ✅ `Incremental-...-19-...-22-...zst` |
+| **TRUE data loss**: wipe PVC data dir on kind node | ✅ `rm -rf /var/local-path-provisioner/pvc-f0ffa1a2.../new.etcd` |
+| Also clear stale `new.etcd.restoration.tmp` from prior interrupted restore | ✅ required — caused false `isDataDirEmpty:false` |
+| Force-delete pod, let StatefulSet restart with fresh PVC | ✅ |
+| Restore from full snapshot at rev 19 + apply 2 delta snapshots | ✅ `deltaCount:2, fromRevision:19` |
+| Verify 21 keys restored (13 Phase A + 5 Phase B base + 3 Phase B delta) | ✅ all `/lifecycle/a/*` + `/lifecycle/b/*` keys present |
+| Write-after-restore: `/lifecycle/b/post-restore` | ✅ put OK, get returns `phase-b-write-after-restore` |
+| Total keys after write-after-restore | ✅ 22 keys |
+
+### Delta StartRevision verified
+- Full snapshot rev=19, delta StartRevision=19 (exact match)
+- Fix from previous session (`lastFullRevision` tracking) confirmed correct
 
 ---
 
@@ -94,18 +108,23 @@ Both phases completed successfully in a single test run.
 
 ---
 
-## Known Gaps
+## Known Gaps (resolved)
 
-### Gap 1: Delta snapshot application not implemented (issue #11)
-- **Behaviour**: `deltaCount:1` skipped with `"skipping delta application — not implemented in v0.1.0 (see issue #11)"`
-- **Impact**: After restore, only last full snapshot state is recovered; keys written between last full and last delta are lost
-- **Test coverage**: `TestRestore_WithDeltas` explicitly documents this behavior
-- **Next step**: Implement MVCC event replay in `pkg/restoration/restoration.go`
+### Gap 1: Delta snapshot application — RESOLVED ✅
+- **Previous state**: `"skipping delta application — not implemented"` 
+- **Fix**: MVCC event replay implemented in `pkg/restoration/restoration.go`; delta events applied to bbolt `key` bucket via `applyDeltas()`
+- **Verified**: Phase A restored 6 delta keys; Phase B restored 3 delta keys; both correct
 
 ### Gap 2: etcd-steward HTTP server → HTTPS server transition
 - **Behaviour**: When TLS is enabled, steward correctly starts HTTPS server on port 8080
 - **Status**: Working ✅ (steward logs `"starting HTTPS server"` in Phase B)
 - **Note**: etcd-wrapper in `skip-san-dev` image uses plain HTTP for steward API; will need update when wrapper switches to HTTPS
+
+### Gap 3: Stale restoration.tmp dir causes false `isDataDirEmpty:false`
+- **Symptom**: After simulating data loss and force-deleting pod, pod reported `isDataDirEmpty:false` and went into CrashLoopBackOff
+- **Root cause**: A previous interrupted restoration left `new.etcd.restoration.tmp` on the PVC. The initializer's `isDataDirEmpty` check looks at the parent directory, not just `new.etcd`, and sees the temp dir
+- **Workaround**: Clear both `new.etcd` AND `new.etcd.restoration.tmp` when simulating data loss
+- **Next step**: Initializer should clean up stale `*.restoration.tmp` dirs on startup before checking emptiness
 
 ---
 
@@ -149,7 +168,13 @@ All tests pass:
 - `go test ./test/utils/...` in etcd-druid: 2 new tests, all pass
 - `go test ./internal/component/statefulset/...` in etcd-druid: all tests pass
 
-End-to-end lifecycle verified (second full run):
-- Phase A (no TLS): ✅ write → full snap → delta → delta snap → restore → verify (3 keys at rev 4)
-- Phase B (TLS): ✅ write → full snap → delta → delta snap → restore → verify (6 keys at rev 7)
-- TLS connectivity verified via FQDN with proper cert SANs
+End-to-end lifecycle verified (final complete run — both phases with TRUE data loss + restore):
+
+| Phase | Cluster | Keys before data loss | Restored keys | Write-after-restore |
+|-------|---------|----------------------|---------------|---------------------|
+| A | no TLS | 12 (9 base + 3 delta) | ✅ 12 | ✅ |
+| B | TLS | 21 (18 from A + 3 delta) | ✅ 21 | ✅ 22 after write |
+
+- Full snapshot at rev 19 (Phase B): StartRevision=0, LastRevision=19 ✅
+- Delta snapshot at rev 19→22 (Phase B): StartRevision=19, LastRevision=22 ✅ (no overlap)
+- Delta StartRevision fix confirmed: `lastFullRevision=19` matches full snapshot exactly

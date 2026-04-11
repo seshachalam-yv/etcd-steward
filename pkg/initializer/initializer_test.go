@@ -81,6 +81,10 @@ func (m *mockClusterClient) RemoveStaleMember(_ context.Context, peerURL string)
 	return nil
 }
 
+func (m *mockClusterClient) UpdateMemberPeerURL(_ context.Context, _ uint64, _ string) error {
+	return nil
+}
+
 func TestInitializer_SingleNode_HappyPath(t *testing.T) {
 	dataDir := t.TempDir()
 	// Create a valid DB file so validation passes.
@@ -369,12 +373,14 @@ func TestInitializer_NeedsExistingClusterState(t *testing.T) {
 		name       string
 		annotation bool
 		recovery   bool
+		learner    bool
 		want       bool
 	}{
-		{"no annotation, no recovery", false, false, false},
-		{"annotation", true, false, true},
-		{"recovery", false, true, true},
-		{"both", true, true, true},
+		{"no annotation, no recovery, not learner", false, false, false, false},
+		{"annotation", true, false, false, true},
+		{"recovery", false, true, false, true},
+		{"learner", false, false, true, true},
+		{"all", true, true, true, true},
 	}
 
 	for _, tc := range tests {
@@ -385,6 +391,9 @@ func TestInitializer_NeedsExistingClusterState(t *testing.T) {
 			init.status.Store(InitializationStatusNew)
 			if tc.recovery {
 				init.inDataLossRecovery.Store(true)
+			}
+			if tc.learner {
+				init.isLearnerMember.Store(true)
 			}
 			if got := init.NeedsExistingClusterState(); got != tc.want {
 				t.Errorf("NeedsExistingClusterState() = %v, want %v", got, tc.want)
@@ -485,7 +494,7 @@ func TestNeedsDataLossRecovery_NotReachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	needs, err := init.needsDataLossRecovery(ctx)
+	needs, _, err := init.needsDataLossRecovery(ctx)
 	if err != nil {
 		t.Fatalf("needsDataLossRecovery returned unexpected error: %v", err)
 	}
@@ -536,7 +545,7 @@ func TestNeedsDataLossRecovery_NonEmptyDir_WasNotMember(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	needs, err := init.needsDataLossRecovery(ctx)
+	needs, _, err := init.needsDataLossRecovery(ctx)
 	if err != nil {
 		t.Fatalf("needsDataLossRecovery returned unexpected error: %v", err)
 	}

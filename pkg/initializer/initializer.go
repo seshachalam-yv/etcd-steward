@@ -64,14 +64,16 @@ type Initializer struct {
 	isSingleNode                 bool
 	hasCreateAsLearnerAnnotation bool
 
-	recorder      statemachine.Recorder
-	memberClient  member.Client
-	clusterClient etcdclient.ClusterClient
-	etcdStatusAPI EtcdStatusAPI
-	etcdEndpoint  string
-	logger        *zap.Logger
-	store         snapstore.Snapstore    // nil if no backup configured
-	compressor    compression.Compressor // nil if no backup configured
+	recorder             statemachine.Recorder
+	memberClient         member.Client
+	clusterClient        etcdclient.ClusterClient
+	serviceClusterClient etcdclient.ClusterClient // optional; uses ClusterIP service endpoint for scale-out detection
+	etcdStatusAPI        EtcdStatusAPI
+	etcdEndpoint         string
+	serviceEndpoint      string // ClusterIP service endpoint for TCP reachability check during scale-out
+	logger               *zap.Logger
+	store                snapstore.Snapstore    // nil if no backup configured
+	compressor           compression.Compressor // nil if no backup configured
 
 	// tcpDialFn is called to check if the etcd endpoint is TCP-reachable.
 	// Defaults to net.Dialer.DialContext; overridable in tests.
@@ -135,7 +137,7 @@ func (i *Initializer) IsLearner() bool {
 // NeedsExistingClusterState returns true if etcd must be started with
 // initial-cluster-state=existing.
 func (i *Initializer) NeedsExistingClusterState() bool {
-	return i.hasCreateAsLearnerAnnotation || i.inDataLossRecovery.Load()
+	return i.hasCreateAsLearnerAnnotation || i.inDataLossRecovery.Load() || i.isLearnerMember.Load()
 }
 
 // GetMemberAndClusterID queries the local etcd to retrieve the member and cluster IDs.
@@ -154,6 +156,140 @@ func (i *Initializer) GetMemberAndClusterID(ctx context.Context) (memberID, clus
 		return "", ""
 	}
 	return fmt.Sprintf("%x", resp.MemberID), fmt.Sprintf("%x", resp.ClusterID)
+}
+
+// SetEtcdStatusAPI injects the etcd status client after etcd has started.
+// Must be called before the first lease renewal tick to populate memberID/clusterID.
+func (i *Initializer) SetEtcdStatusAPI(api EtcdStatusAPI) {
+	i.etcdStatusAPI = api
+}
+
+// SetServiceClusterClient injects a cluster client that connects via the ClusterIP service
+// endpoint (e.g. test-client:2379). Used during scale-out to detect existing cluster membership
+// without requiring the local etcd to be running.
+func (i *Initializer) SetServiceClusterClient(client etcdclient.ClusterClient, serviceEndpoint string) {
+	i.serviceClusterClient = client
+	i.serviceEndpoint = serviceEndpoint
+}
+
+// activeClusterClient returns serviceClusterClient if configured, otherwise clusterClient.
+// The service cluster client connects to the ClusterIP service and is usable even when
+// the local etcd has not started yet (scale-out scenario).
+func (i *Initializer) activeClusterClient() etcdclient.ClusterClient {
+	if i.serviceClusterClient != nil {
+		return i.serviceClusterClient
+	}
+	return i.clusterClient
+}
+
+// GetCurrentMembersInitialCluster fetches the current cluster membership and returns
+// an initial-cluster string ("name=peerURL,...") containing only the members that are
+// actually in the cluster right now. Used when joining as a learner so that the
+// initial-cluster field in the etcd config matches the real cluster size rather than
+// the full planned replica count from the ConfigMap.
+//
+// configMapEntries is a name→peerURL map from the ConfigMap's initial-cluster field.
+// It is used to:
+//  1. Resolve names for unnamed learner members (newly added, no name yet in etcd).
+//     Matching is done by normalising away the URL scheme so http://host and https://host
+//     are considered the same peer. This handles TLS-transition scenarios.
+//  2. Use the ConfigMap's peerURL for unnamed learners (they don't have a live URL yet).
+//
+// For existing named members, the live cluster peerURL is used as-is to avoid
+// mismatches: if TLS migration is in progress, the live cluster URL reflects the
+// member's current state, which etcd validates on startup.
+//
+// Returns empty string if the cluster is unreachable (caller falls back to ConfigMap value).
+func (i *Initializer) GetCurrentMembersInitialCluster(ctx context.Context, configMapEntries map[string]string) string {
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	members, err := i.activeClusterClient().ListMembers(queryCtx)
+	if err != nil {
+		i.logger.Warn("GetCurrentMembersInitialCluster: failed to list members, falling back to ConfigMap value",
+			zap.Error(err),
+		)
+		return ""
+	}
+
+	// Build a reverse map: normalised peerURL host+path → ConfigMap name, for unnamed learner lookup.
+	// "normalised" means stripping the scheme prefix so http://host and https://host match.
+	normalise := func(u string) string {
+		if idx := strings.Index(u, "://"); idx >= 0 {
+			return u[idx+3:]
+		}
+		return u
+	}
+	normToName := make(map[string]string, len(configMapEntries))
+	nameToConfigURL := make(map[string]string, len(configMapEntries))
+	for name, url := range configMapEntries {
+		normToName[normalise(url)] = name
+		nameToConfigURL[name] = url
+	}
+
+	parts := make([]string, 0, len(members))
+	for _, m := range members {
+		if len(m.PeerURLs) == 0 {
+			continue
+		}
+		name := m.Name
+
+		if name == "" {
+			// Unnamed learner: resolve name using normalised URL matching against ConfigMap.
+			for _, u := range m.PeerURLs {
+				if n, ok := normToName[normalise(u)]; ok {
+					name = n
+					break
+				}
+			}
+			if name == "" {
+				continue // cannot resolve — skip
+			}
+		}
+
+		// Always use the ConfigMap URL for all members (named or unnamed).
+		// The ConfigMap represents the desired state and always has the correct scheme
+		// (e.g. https:// after TLS is enabled). The live cluster peerURL may be stale
+		// (still http://) because etcd does not automatically update member peerURLs on restart.
+		peerURL, ok := nameToConfigURL[name]
+		if !ok {
+			// Member not in ConfigMap (e.g. a concurrent scale-up peer not yet in the ConfigMap).
+			// Fall back to live URL.
+			peerURL = m.PeerURLs[0]
+		}
+
+		// If the member's registered peer URL differs from the ConfigMap URL (scheme mismatch
+		// during TLS migration), proactively update it via MemberUpdate. This ensures that
+		// when the next learner joins, etcd's peer URL validation passes.
+		if len(m.PeerURLs) > 0 && m.PeerURLs[0] != peerURL && name != "" {
+			updateCtx, updateCancel := context.WithTimeout(ctx, 10*time.Second)
+			updateErr := i.activeClusterClient().UpdateMemberPeerURL(updateCtx, m.ID, peerURL)
+			updateCancel()
+			if updateErr != nil {
+				i.logger.Warn("GetCurrentMembersInitialCluster: failed to update member peerURL",
+					zap.String("member", name),
+					zap.String("from", m.PeerURLs[0]),
+					zap.String("to", peerURL),
+					zap.Error(updateErr),
+				)
+			} else {
+				i.logger.Info("GetCurrentMembersInitialCluster: updated stale peer URL in cluster membership",
+					zap.String("member", name),
+					zap.String("from", m.PeerURLs[0]),
+					zap.String("to", peerURL),
+				)
+			}
+		}
+
+		parts = append(parts, name+"="+peerURL)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	result := parts[0]
+	for _, p := range parts[1:] {
+		result += "," + p
+	}
+	return result
 }
 
 // Start begins the initialization process for the given mode.
@@ -187,7 +323,10 @@ func (i *Initializer) run(ctx context.Context, mode string) {
 		i.logger.Warn("failed to record initial New transition, continuing", zap.Error(err))
 	}
 
-	err := i.initialize(ctx, mode)
+	resolvedPath, err := i.initialize(ctx, mode)
+	if resolvedPath != "" {
+		path = resolvedPath
+	}
 	duration := time.Since(start).Seconds()
 	metrics.InitializationDurationSeconds.WithLabelValues(i.memberNamespace, i.memberName, path).Observe(duration)
 	if err != nil {
@@ -215,17 +354,19 @@ func (i *Initializer) record(ctx context.Context, t statemachine.Transition) err
 }
 
 // initialize dispatches to the appropriate initialization path based on member state.
-func (i *Initializer) initialize(ctx context.Context, mode string) error {
+// It returns the DEP-04 path label ("A", "B", "C", "D") for metrics and an error.
+func (i *Initializer) initialize(ctx context.Context, mode string) (string, error) {
 	// Path B: scale-up -- new member joining existing cluster as learner.
 	if i.hasCreateAsLearnerAnnotation {
-		return i.initializeAsLearner(ctx)
+		return "B", i.initializeAsLearner(ctx)
 	}
-	// Path A/C: existing or fresh member -- use DB validation.
+	// Path A/C/D: existing or fresh member -- use DB validation.
 	return i.initializeFromDB(ctx, mode)
 }
 
-// initializeFromDB handles Path A (restart with DB validation) and Path C (fresh single-node).
-func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
+// initializeFromDB handles Path A (restart with DB validation), Path C (fresh single-node),
+// and Path D (snapshot restore). Returns the DEP-04 path label for metrics.
+func (i *Initializer) initializeFromDB(ctx context.Context, mode string) (string, error) {
 	var valMode validator.ValidationMode
 	var subState statemachine.SubState
 	var reason statemachine.Reason
@@ -245,10 +386,29 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 		SubState: &subState,
 		Reason:   reason,
 	}); err != nil {
-		return fmt.Errorf("failed to record DB validation transition: %w", err)
+		return "unknown", fmt.Errorf("failed to record DB validation transition: %w", err)
 	}
 
 	result := validator.Validate(i.dataDir, valMode)
+	validationResult := "success"
+	if !result.Valid {
+		validationResult = "failure"
+	}
+	metrics.ValidationTotal.WithLabelValues(i.memberNamespace, i.memberName, mode, validationResult).Inc()
+
+	// Detect read-only data volume and surface it as a condition on the EtcdMember.
+	if result.IsReadOnly {
+		cond := member.Condition{
+			Type:    member.ConditionDataVolumeReadOnly,
+			Status:  "True",
+			Reason:  "PVCReadOnly",
+			Message: result.Err.Error(),
+		}
+		if condErr := i.memberClient.SetCondition(ctx, i.memberName, i.memberNamespace, cond); condErr != nil {
+			i.logger.Error("failed to set DataVolumeReadOnly condition", zap.Error(condErr))
+		}
+	}
+
 	i.logger.Info("DB validation result",
 		zap.String("mode", mode),
 		zap.Bool("valid", result.Valid),
@@ -269,7 +429,7 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 				SubState: &restorationSubState,
 				Reason:   statemachine.ReasonDBValidationFailed,
 			}); err != nil {
-				return fmt.Errorf("failed to record restoration transition: %w", err)
+				return "D", fmt.Errorf("failed to record restoration transition: %w", err)
 			}
 
 			restoreStart := metav1.Now()
@@ -285,7 +445,7 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 						Message:   &msg,
 					},
 				})
-				return fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
+				return "D", fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
 			}
 			restoreEnd := metav1.Now()
 			// Only update LastRestoration status if there were actual snapshots to restore from.
@@ -309,27 +469,34 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 					SubState: &leaderSubState,
 					Reason:   statemachine.ReasonRestorationSucceeded,
 				}); err != nil {
-					return fmt.Errorf("failed to record restoration success transition: %w", err)
+					return "D", fmt.Errorf("failed to record restoration success transition: %w", err)
 				}
-				return nil
+				return "D", nil
 			}
-			// No snapshots found — fall through to fresh start (same as no-store case).
+			// No snapshots found — fall through to fresh start (Path C).
 		}
 
-		// Multi-node: check for data-loss recovery.
+		// Multi-node: check for data-loss recovery or scale-up join.
 		if !i.isSingleNode {
-			needsRecovery, err := i.needsDataLossRecovery(ctx)
+			needsRecovery, isNewJoin, err := i.needsDataLossRecovery(ctx)
 			if err != nil {
 				i.logger.Warn("failed to check cluster membership for data-loss detection, falling back to empty-dir check",
 					zap.Error(err))
 				needsRecovery = i.isDataDirEmpty()
+				isNewJoin = false
 			}
 			if needsRecovery {
 				i.logger.Info("detected data loss in multi-node cluster, triggering recovery",
 					zap.String("member", i.memberName),
 					zap.String("dataDir", i.dataDir),
 				)
-				return i.initializeDataLossRecovery(ctx)
+				return "D", i.initializeDataLossRecovery(ctx)
+			}
+			if isNewJoin {
+				i.logger.Info("cluster reachable and member not registered, joining as learner (scale-up)",
+					zap.String("member", i.memberName),
+				)
+				return "B", i.initializeAsLearner(ctx)
 			}
 		}
 
@@ -339,8 +506,11 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 		}
 
 		reasonStarted := statemachine.ReasonDBValidationSucceeded
+		// Path C: fresh single-node cluster with empty data dir.
+		pathLabel := "A"
 		if i.isSingleNode && mode == "full" {
 			reasonStarted = statemachine.ReasonNewSingleNodeClusterCreated
+			pathLabel = "C"
 		}
 
 		if err := i.record(ctx, statemachine.Transition{
@@ -348,12 +518,12 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 			SubState: &subStateStarted,
 			Reason:   reasonStarted,
 		}); err != nil {
-			return fmt.Errorf("failed to record started transition: %w", err)
+			return pathLabel, fmt.Errorf("failed to record started transition: %w", err)
 		}
-		return nil
+		return pathLabel, nil
 	}
 
-	// DB validation failed.
+	// DB validation failed — Path D (snapshot restore).
 	if i.isSingleNode {
 		restorationSubState := statemachine.SubStateRestoration
 		if err := i.record(ctx, statemachine.Transition{
@@ -361,7 +531,7 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 			SubState: &restorationSubState,
 			Reason:   statemachine.ReasonDBValidationFailed,
 		}); err != nil {
-			return fmt.Errorf("failed to record restoration transition: %w", err)
+			return "D", fmt.Errorf("failed to record restoration transition: %w", err)
 		}
 
 		restoreStart := metav1.Now()
@@ -377,7 +547,7 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 					Message:   &msg,
 				},
 			})
-			return fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
+			return "D", fmt.Errorf("restoration failed for member %s: %w", i.memberName, err)
 		}
 		restoreEnd := metav1.Now()
 		if err := i.memberClient.UpdateStatus(ctx, i.memberName, i.memberNamespace, member.UpdateStatusOpts{
@@ -397,9 +567,9 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 			SubState: &leaderSubState,
 			Reason:   statemachine.ReasonRestorationSucceeded,
 		}); err != nil {
-			return fmt.Errorf("failed to record restoration success transition: %w", err)
+			return "D", fmt.Errorf("failed to record restoration success transition: %w", err)
 		}
-		return nil
+		return "D", nil
 	}
 
 	// Multi-node: DB validation failed.
@@ -415,19 +585,19 @@ func (i *Initializer) initializeFromDB(ctx context.Context, mode string) error {
 		Reason:  statemachine.ReasonDBValidationFailed,
 		Message: fmt.Sprintf("DB validation failed, re-joining as learner: %v", result.Err),
 	}); err != nil {
-		return fmt.Errorf("failed to record New transition after DB validation failure: %w", err)
+		return "D", fmt.Errorf("failed to record New transition after DB validation failure: %w", err)
 	}
 	if err := os.RemoveAll(i.dataDir); err != nil {
-		return fmt.Errorf("failed to remove data directory after DB validation failure for %s: %w", i.memberName, err)
+		return "D", fmt.Errorf("failed to remove data directory after DB validation failure for %s: %w", i.memberName, err)
 	}
-	if err := i.clusterClient.RemoveStaleMember(ctx, i.peerURL); err != nil {
+	if err := i.activeClusterClient().RemoveStaleMember(ctx, i.peerURL); err != nil {
 		// Log but do not fatal — the member may not be registered yet (e.g. first startup).
 		i.logger.Warn("failed to remove stale member entry before re-joining, proceeding anyway",
 			zap.String("peerURL", i.peerURL),
 			zap.Error(err),
 		)
 	}
-	return i.joinAsLearner(ctx)
+	return "D", i.joinAsLearner(ctx)
 }
 
 // isDataDirEmpty returns true if the etcd data directory contains no DB or WAL files.
@@ -444,50 +614,84 @@ func (i *Initializer) isDataDirEmpty() bool {
 	return len(entries) == 0
 }
 
-// needsDataLossRecovery returns true if this member needs to rejoin the cluster as a learner.
-// Returns false when the cluster is unreachable (fresh bootstrap — no cluster exists yet).
-func (i *Initializer) needsDataLossRecovery(ctx context.Context) (bool, error) {
+// needsDataLossRecovery returns (needsRecovery, isNewJoin, error).
+// needsRecovery is true if this member was previously in the cluster but its data dir is empty.
+// isNewJoin is true if the cluster is reachable but this member has never been registered (scale-up).
+// Returns (false, false, nil) when the cluster is unreachable (fresh bootstrap).
+func (i *Initializer) needsDataLossRecovery(ctx context.Context) (bool, bool, error) {
 	// Fast TCP check first — avoids the gRPC connection-establishment hang when no etcd is running.
 	if !i.isEtcdReachable(ctx) {
 		i.logger.Info("cluster not reachable via TCP, skipping data-loss check",
 			zap.String("member", i.memberName),
 		)
-		return false, nil
+		return false, false, nil
+	}
+
+	// Use the service cluster client (ClusterIP service) when available — it can reach the
+	// existing cluster even when the local etcd endpoint is not yet running (scale-out).
+	// Fall back to the local cluster client for single-node or when not configured.
+	cc := i.clusterClient
+	if i.serviceClusterClient != nil {
+		cc = i.serviceClusterClient
 	}
 
 	if !i.isDataDirEmpty() {
 		// Non-empty data dir: check if THIS member is still registered in the cluster.
 		// If not, it was removed and needs to rejoin.
+		// Use scheme-agnostic matching: during TLS migration the cluster may still have the
+		// old http:// URL for this member while we now advertise https://. Same host:port → same member.
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		wasInCluster, err := i.clusterClient.WasMemberInCluster(checkCtx, i.peerURL)
+		members, err := cc.ListMembers(checkCtx)
 		if err != nil {
-			return false, fmt.Errorf("failed to query cluster membership: %w", err)
+			return false, false, fmt.Errorf("failed to query cluster membership: %w", err)
 		}
-		return !wasInCluster, nil
+		registered := isMemberRegisteredByHostPort(members, i.peerURL)
+		return !registered, false, nil
 	}
-	// Data dir is empty — do a full membership query to check for data-loss recovery.
-	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	members, err := i.clusterClient.ListMembers(checkCtx)
-	if err != nil {
-		// Cluster not reachable → fresh bootstrap, not data-loss recovery.
-		i.logger.Info("cluster not reachable, treating empty data dir as fresh bootstrap",
-			zap.String("member", i.memberName),
-			zap.Error(err),
-		)
-		return false, nil
-	}
-	// Cluster is reachable and data dir is empty → data-loss recovery.
-	for _, m := range members {
-		for _, u := range m.PeerURLs {
-			if u == i.peerURL {
-				return true, nil
+	// Data dir is empty — do a full membership query to determine state.
+	// Retry with backoff: TCP probe succeeded so a cluster likely exists; gRPC may need a
+	// moment for the kube-proxy routing to stabilise after a scale-out.
+	var members []etcdclient.Member
+	{
+		const maxAttempts = 5
+		backoff := 1 * time.Second
+		var lastErr error
+		for attempt := range maxAttempts {
+			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			members, lastErr = cc.ListMembers(checkCtx)
+			cancel()
+			if lastErr == nil {
+				break
+			}
+			i.logger.Info("ListMembers failed, retrying",
+				zap.String("member", i.memberName),
+				zap.Int("attempt", attempt+1),
+				zap.Error(lastErr),
+			)
+			select {
+			case <-ctx.Done():
+				return false, false, ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
 			}
 		}
+		if lastErr != nil {
+			// Cluster still not reachable via gRPC → fresh bootstrap, not data-loss recovery.
+			i.logger.Info("cluster not reachable after retries, treating empty data dir as fresh bootstrap",
+				zap.String("member", i.memberName),
+				zap.Error(lastErr),
+			)
+			return false, false, nil
+		}
 	}
-	// Data dir empty and not in cluster → joining as new member (scale-up handled elsewhere).
-	return false, nil
+	// Cluster is reachable. Check if this member is registered (scheme-agnostic match).
+	if isMemberRegisteredByHostPort(members, i.peerURL) {
+		// Member is registered but data dir is empty → data-loss recovery needed.
+		return true, false, nil
+	}
+	// Cluster reachable but member not registered → new member joining via scale-up.
+	return false, true, nil
 }
 
 // isEtcdReachable checks whether any etcd peer in the cluster is reachable via TCP.
@@ -513,11 +717,21 @@ func (i *Initializer) isEtcdReachable(ctx context.Context) bool {
 }
 
 // clusterTCPAddrs returns TCP addresses to probe for cluster reachability.
+// The ClusterIP service endpoint (if configured) is tried first — it is reachable whenever
+// any healthy etcd member is running, even when the local etcd has not started yet.
 // Peer client addresses (derived from initial-cluster peer URLs, converting port 2380→2379)
-// are tried first so that a corrupted member can detect its live peers.
+// are tried next so that a corrupted member can detect its live peers.
 // The local etcd endpoint is appended as a final fallback.
 func (i *Initializer) clusterTCPAddrs() []string {
 	var addrs []string
+
+	// ClusterIP service endpoint is the most reliable probe for scale-out: it routes to any
+	// healthy pod in the cluster, even when the joining member's local etcd hasn't started.
+	if i.serviceEndpoint != "" {
+		if addr := urlToTCPAddr(i.serviceEndpoint); addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
 
 	// Parse initial-cluster: "name1=peerURL1,name2=peerURL2,..."
 	// For each peer that is NOT this member, derive its client address (2380→2379).
@@ -594,7 +808,35 @@ func indexOf(s string, b byte) int {
 	return -1
 }
 
-// initializeDataLossRecovery handles the case where a multi-node member's PVC was deleted.
+// isMemberRegisteredByHostPort returns true if any member in the cluster has a peer URL
+// whose host:port matches the host:port of peerURL (scheme-agnostic).
+// This handles TLS migration: after enabling peer TLS, the member's configured URL changes
+// from http:// to https://, but it's still the same member in the cluster.
+func isMemberRegisteredByHostPort(members []etcdclient.Member, peerURL string) bool {
+	targetHostPort := urlToTCPAddr(peerURL)
+	for _, m := range members {
+		for _, u := range m.PeerURLs {
+			if urlToTCPAddr(u) == targetHostPort {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// findStaleURLForMember returns the peer URL currently registered in the cluster for the
+// member whose host:port matches peerURL (scheme-agnostic). Returns empty string if not found.
+func findStaleURLForMember(members []etcdclient.Member, peerURL string) string {
+	targetHostPort := urlToTCPAddr(peerURL)
+	for _, m := range members {
+		for _, u := range m.PeerURLs {
+			if urlToTCPAddr(u) == targetHostPort {
+				return u
+			}
+		}
+	}
+	return ""
+}
 func (i *Initializer) initializeDataLossRecovery(ctx context.Context) error {
 	i.inDataLossRecovery.Store(true)
 
@@ -611,7 +853,17 @@ func (i *Initializer) initializeDataLossRecovery(ctx context.Context) error {
 	i.logger.Info("removing stale member entry before rejoining as learner",
 		zap.String("peerURL", i.peerURL),
 	)
-	if err := i.clusterClient.RemoveStaleMember(ctx, i.peerURL); err != nil {
+	// Look up the actual URL registered in the cluster (may differ in scheme due to TLS migration).
+	removeCtx, removeCancel := context.WithTimeout(ctx, 10*time.Second)
+	members, listErr := i.activeClusterClient().ListMembers(removeCtx)
+	removeCancel()
+	staleURL := i.peerURL
+	if listErr == nil {
+		if found := findStaleURLForMember(members, i.peerURL); found != "" {
+			staleURL = found
+		}
+	}
+	if err := i.activeClusterClient().RemoveStaleMember(ctx, staleURL); err != nil {
 		return fmt.Errorf("failed to remove stale member for %s: %w", i.memberName, err)
 	}
 
@@ -673,7 +925,7 @@ func (i *Initializer) joinAsLearner(ctx context.Context) error {
 		return fmt.Errorf("failed to clear data directory before learner join: %w", err)
 	}
 
-	memberID, err := i.clusterClient.AddLearner(ctx, i.peerURL)
+	memberID, err := i.activeClusterClient().AddLearner(ctx, i.peerURL)
 	if err != nil {
 		return fmt.Errorf("failed to add member %s as learner: %w", i.memberName, err)
 	}
@@ -694,7 +946,7 @@ func (i *Initializer) joinAsLearner(ctx context.Context) error {
 
 // findExistingLearnerMember checks if this member is already registered as a learner.
 func (i *Initializer) findExistingLearnerMember(ctx context.Context) (bool, uint64, error) {
-	members, err := i.clusterClient.ListMembers(ctx)
+	members, err := i.activeClusterClient().ListMembers(ctx)
 	if err != nil {
 		return false, 0, err
 	}
@@ -754,7 +1006,7 @@ func (i *Initializer) promoteLearner(ctx context.Context, memberID uint64) error
 				backoff = 60 * time.Second
 			}
 		}
-		err := i.clusterClient.PromoteMember(ctx, memberID)
+		err := i.activeClusterClient().PromoteMember(ctx, memberID)
 		if err == nil {
 			return nil
 		}

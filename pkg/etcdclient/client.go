@@ -43,6 +43,8 @@ type ClusterClient interface {
 	// RemoveStaleMember removes any member whose PeerURLs contain peerURL.
 	// Returns nil if no matching member is found (idempotent).
 	RemoveStaleMember(ctx context.Context, peerURL string) error
+	// UpdateMemberPeerURL updates the peer URL of the member with the given ID.
+	UpdateMemberPeerURL(ctx context.Context, memberID uint64, peerURL string) error
 }
 
 // EtcdClusterClient implements ClusterClient using the etcd client v3 Cluster interface.
@@ -58,24 +60,33 @@ func NewClusterClient(client *clientv3.Client) ClusterClient {
 	return &EtcdClusterClient{
 		cluster:           client.Cluster,
 		initialBackoff:    500 * time.Millisecond,
-		maxRetries:        6,
+		maxRetries:        20,
 		perAttemptTimeout: 30 * time.Second,
 	}
 }
 
 // AddLearner adds a member with the given peer URL as a non-voting learner.
-// It retries up to 6 times with exponential backoff starting at initialBackoff.
+// It retries up to maxRetries times with exponential backoff starting at initialBackoff.
+// For transient "too many learner members" errors (another member is being promoted)
+// a fixed short backoff is used instead of exponential to recover quickly.
 // If the peer URL already exists, returns the existing member's ID (idempotent).
 func (c *EtcdClusterClient) AddLearner(ctx context.Context, peerURL string) (uint64, error) {
 	var lastErr error
 	backoff := c.initialBackoff
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
 		if attempt > 0 {
+			wait := backoff
+			// "too many learner members" is transient: another member is being promoted.
+			// Use a fixed short wait instead of exponential so we recover quickly.
+			if lastErr != nil && strings.Contains(lastErr.Error(), "too many learner members") {
+				wait = 5 * time.Second
+			} else {
+				backoff *= 2
+			}
 			select {
 			case <-ctx.Done():
 				return 0, ctx.Err()
-			case <-time.After(backoff):
-				backoff *= 2
+			case <-time.After(wait):
 			}
 		}
 
@@ -167,21 +178,57 @@ func (c *EtcdClusterClient) WasMemberInCluster(ctx context.Context, peerURL stri
 }
 
 // RemoveStaleMember removes any member whose PeerURLs contain peerURL.
-// It is idempotent: returns nil if no matching member is found.
+// Retries on "unhealthy cluster" errors that can occur during rolling StatefulSet updates
+// when the cluster briefly reports unhealthy due to the recently-terminated member.
 func (c *EtcdClusterClient) RemoveStaleMember(ctx context.Context, peerURL string) error {
-	resp, err := c.cluster.MemberList(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to list members to find stale entry: %w", err)
-	}
-	for _, m := range resp.Members {
-		for _, u := range m.PeerURLs {
-			if u == peerURL {
-				if _, err := c.cluster.MemberRemove(ctx, m.ID); err != nil {
-					return fmt.Errorf("failed to remove stale member %x (peerURL %s): %w", m.ID, peerURL, err)
+	const maxAttempts = 10
+	backoff := 3 * time.Second
+	var lastErr error
+	for attempt := range maxAttempts {
+		resp, err := c.cluster.MemberList(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list members to find stale entry: %w", err)
+		}
+		var found bool
+		for _, m := range resp.Members {
+			for _, u := range m.PeerURLs {
+				if u == peerURL {
+					found = true
+					_, removeErr := c.cluster.MemberRemove(ctx, m.ID)
+					if removeErr == nil {
+						return nil
+					}
+					if !strings.Contains(removeErr.Error(), "unhealthy cluster") {
+						return fmt.Errorf("failed to remove stale member %x (peerURL %s): %w", m.ID, peerURL, removeErr)
+					}
+					lastErr = removeErr
 				}
-				return nil
 			}
 		}
+		if !found {
+			return nil
+		}
+		if attempt < maxAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+		}
+	}
+	return fmt.Errorf("failed to remove stale member (peerURL %s) after %d attempts: %w", peerURL, maxAttempts, lastErr)
+}
+
+// UpdateMemberPeerURL updates the peer URLs of the member with the given ID.
+// This is used when a member's advertised peer URL changes (e.g. after enabling peer TLS).
+func (c *EtcdClusterClient) UpdateMemberPeerURL(ctx context.Context, memberID uint64, peerURL string) error {
+	_, err := c.cluster.MemberUpdate(ctx, memberID, []string{peerURL})
+	if err != nil {
+		return fmt.Errorf("failed to update peer URL for member %x: %w", memberID, err)
 	}
 	return nil
 }

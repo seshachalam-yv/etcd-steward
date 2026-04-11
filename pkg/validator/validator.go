@@ -6,10 +6,12 @@
 package validator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	bbolt "go.etcd.io/bbolt"
@@ -29,6 +31,9 @@ const (
 type Result struct {
 	// Valid is true if the DB passed validation.
 	Valid bool
+	// IsReadOnly is true if the DB open failed because the volume is read-only (EROFS).
+	// When true, Valid is false and Err is set.
+	IsReadOnly bool
 	// Err holds the error if validation failed.
 	Err error
 }
@@ -83,6 +88,9 @@ func Validate(dataDir string, mode ValidationMode) Result {
 		Timeout:  5 * time.Second,
 	})
 	if err != nil {
+		if isReadOnlyError(err) {
+			return Result{Valid: false, IsReadOnly: true, Err: fmt.Errorf("data volume is read-only: %w", err)}
+		}
 		return Result{Valid: false, Err: fmt.Errorf("failed to open DB: %w", err)}
 	}
 	defer db.Close() //nolint:errcheck
@@ -99,4 +107,9 @@ func Validate(dataDir string, mode ValidationMode) Result {
 	}
 
 	return Result{Valid: true}
+}
+
+// isReadOnlyError returns true if err indicates the filesystem is read-only (EROFS).
+func isReadOnlyError(err error) bool {
+	return errors.Is(err, syscall.EROFS) || errors.Is(err, os.ErrPermission)
 }

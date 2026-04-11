@@ -413,3 +413,165 @@ func TestRun_ExitsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return after context cancellation")
 	}
 }
+
+// snapWithAge creates a snapshot with a CreatedOn time offset from now.
+func snapWithAge(kind string, startRev, lastRev int64, age time.Duration) snapstore.Snapshot {
+	s := snap(kind, startRev, lastRev)
+	s.CreatedOn = time.Now().UTC().Add(-age)
+	return s
+}
+
+func TestCollect_TimeBased_DeletesOldSets(t *testing.T) {
+	// Two old sets (>2h) and one recent set (<2h).
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snapWithAge("Full", 0, 100, 3*time.Hour),         // old — should be deleted
+			snapWithAge("Incremental", 100, 150, 3*time.Hour), // old
+			snapWithAge("Full", 0, 200, 2*time.Hour+1*time.Minute), // old
+			snapWithAge("Full", 0, 300, 30*time.Minute),      // recent — keep (also newest, never deleted)
+		},
+	}
+	gc := NewWithConfig(store, "default", "etcd-main", Config{
+		Policy:               PolicyTimeBased,
+		MaxRetentionDuration: 2 * time.Hour,
+	}, zap.NewNop())
+
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+
+	// Oldest two sets deleted (Full@100 + Incr@150, Full@200).
+	if len(store.deleted) != 3 {
+		t.Fatalf("expected 3 deletes, got %d", len(store.deleted))
+	}
+
+	// Newest (Full@300) must not be deleted.
+	for _, d := range store.deleted {
+		if d.LastRevision == 300 {
+			t.Error("newest snapshot (rev 300) should not be deleted by TimeBased GC")
+		}
+	}
+}
+
+func TestCollect_TimeBased_KeepsAllWhenNotExpired(t *testing.T) {
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snapWithAge("Full", 0, 100, 30*time.Minute),
+			snapWithAge("Full", 0, 200, 10*time.Minute),
+		},
+	}
+	gc := NewWithConfig(store, "default", "etcd-main", Config{
+		Policy:               PolicyTimeBased,
+		MaxRetentionDuration: 1 * time.Hour,
+	}, zap.NewNop())
+
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+	if len(store.deleted) != 0 {
+		t.Errorf("expected 0 deletes for unexpired snapshots, got %d", len(store.deleted))
+	}
+}
+
+func TestCollect_Calendar_DailyRetention(t *testing.T) {
+	now := time.Now().UTC()
+	// Create 10 sets on 10 different days. Calendar policy with daily=3 should keep 3 days.
+	snaps := make([]snapstore.Snapshot, 10)
+	for i := 0; i < 10; i++ {
+		rev := int64((i + 1) * 100)
+		s := snapWithAge("Full", 0, rev, time.Duration(10-i)*24*time.Hour)
+		s.CreatedOn = s.CreatedOn.Truncate(24 * time.Hour).Add(time.Duration(i) * time.Hour) // distinct hours within distinct days
+		_ = now
+		snaps[i] = s
+	}
+	store := &mockSnapstore{snaps: snaps}
+
+	gc := NewWithConfig(store, "default", "etcd-main", Config{
+		Policy:          PolicyCalendar,
+		DailyRetention:  3,
+	}, zap.NewNop())
+
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+
+	// With 10 sets on 10 different days and daily=3, at least 7 should be deleted.
+	if len(store.deleted) < 7 {
+		t.Errorf("expected >= 7 deletes with daily=3, got %d", len(store.deleted))
+	}
+
+	// Most recent set must never be deleted.
+	newestRev := int64(1000)
+	for _, d := range store.deleted {
+		if d.LastRevision == newestRev {
+			t.Errorf("newest snapshot (rev %d) should not be deleted by Calendar GC", newestRev)
+		}
+	}
+}
+
+func TestCollect_Exponential_KeepsRecentAndOld(t *testing.T) {
+	// Create sets at various ages: <1h (many), <24h (same hour bucket), <7d, older.
+	// The exponential policy scans newest-to-oldest by LastRevision (list is asc-sorted).
+	// For the 24h window: rev 110 has higher LastRevision so it wins its hour bucket;
+	// rev 100 (same hour, lower LastRevision) is discarded.
+	now := time.Now().UTC()
+	inSameHour1 := now.Add(-3*time.Hour - 10*time.Minute) // assigned to rev 100
+	inSameHour2 := now.Add(-3*time.Hour - 20*time.Minute) // assigned to rev 110 (higher rev wins)
+
+	snap100 := snap("Full", 0, 100)
+	snap100.CreatedOn = inSameHour1 // same hour as snap110 but lower LastRevision
+	snap110 := snap("Full", 0, 110)
+	snap110.CreatedOn = inSameHour2 // same hour; rev 110 > rev 100 → wins bucket
+
+	store := &mockSnapstore{
+		snaps: []snapstore.Snapshot{
+			snapWithAge("Full", 0, 10, 30*time.Minute),     // <1h — keep
+			snapWithAge("Full", 0, 20, 20*time.Minute),     // <1h — keep (newest overall)
+			snap100,                                          // 24h window, same hour as snap110
+			snap110,                                          // 24h window, wins hour bucket (higher rev)
+			snapWithAge("Full", 0, 200, 48*time.Hour),      // day window
+			snapWithAge("Full", 0, 300, 6*24*time.Hour),    // day window
+			snapWithAge("Full", 0, 1000, 8*7*24*time.Hour), // >4w — too old
+		},
+	}
+	gc := NewWithConfig(store, "default", "etcd-main", Config{
+		Policy: PolicyExponential,
+	}, zap.NewNop())
+
+	if err := gc.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect error: %v", err)
+	}
+
+	// Newest set (rev 20) — never deleted.
+	for _, d := range store.deleted {
+		if d.LastRevision == 20 {
+			t.Error("newest snapshot (rev 20) should not be deleted by Exponential GC")
+		}
+	}
+
+	// Rev 110 wins the hour bucket (higher revision); rev 100 should be discarded.
+	found100 := false
+	for _, d := range store.deleted {
+		if d.LastRevision == 100 {
+			found100 = true
+		}
+	}
+	if !found100 {
+		t.Error("same-hour lower-revision snapshot (rev 100) should have been deleted; rev 110 wins the bucket")
+	}
+}
+
+func TestNewWithConfig_DefaultsLimitBased(t *testing.T) {
+	store := &mockSnapstore{}
+	gc := NewWithConfig(store, "default", "etcd", Config{}, zap.NewNop())
+	if gc == nil {
+		t.Fatal("expected non-nil GarbageCollector")
+	}
+	// Default policy should be LimitBased with maxFullSnapshots=7.
+	if gc.cfg.Policy != PolicyLimitBased {
+		t.Errorf("expected default policy %q, got %q", PolicyLimitBased, gc.cfg.Policy)
+	}
+	if gc.cfg.MaxFullSnapshots != 7 {
+		t.Errorf("expected default MaxFullSnapshots=7, got %d", gc.cfg.MaxFullSnapshots)
+	}
+}

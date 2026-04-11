@@ -116,6 +116,7 @@ func main() {
 	fs.Bool("compress-snapshots", false, "enable snapshot compression")
 	fs.String("compression-policy", "gzip", "snapshot compression policy")
 	fs.String("etcd-snapshot-timeout", "10m", "timeout for etcd snapshot operation")
+	fs.Bool("enable-snapshot-lease-updates", true, "update K8s snapshot leases after each snapshot (disable when etcd-druid uses UseEtcdSteward mode)")
 
 	// Parse args, skipping the "server" subcommand token if present.
 	args := os.Args[1:]
@@ -184,6 +185,11 @@ func main() {
 		}
 	} else if !compressEnabled {
 		cfg.CompressionPolicy = "none"
+	}
+
+	// Configure snapshot lease updates (default true — backward compatible).
+	if v, err := fs.GetBool("enable-snapshot-lease-updates"); err == nil {
+		cfg.EnableSnapshotLeaseUpdates = v
 	}
 
 	// Capture listen URLs for etcd config YAML.
@@ -352,7 +358,10 @@ func main() {
 		if cfg.EnableDistributedLock {
 			snapshotLock = lock.New(etcdClient, cfg.PodNamespace, cfg.EtcdName+"-snapshot")
 		}
-		leaseUpdater := snapshotlease.New(cfg.EtcdName, cfg.PodNamespace, k8sClientset.CoordinationV1(), logger.Named("snapshotlease"))
+		var leaseUpdater snapshotter.SnapshotLeaseUpdater
+		if cfg.EnableSnapshotLeaseUpdates {
+			leaseUpdater = snapshotlease.New(cfg.EtcdName, cfg.PodNamespace, k8sClientset.CoordinationV1(), logger.Named("snapshotlease"))
+		}
 		snap = snapshotter.New(
 			store, comp,
 			cfg.EtcdName, cfg.PodNamespace,

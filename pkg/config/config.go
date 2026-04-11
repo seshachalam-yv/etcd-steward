@@ -66,6 +66,13 @@ type Config struct {
 	DefragPeriod          time.Duration `json:"defragPeriod"`
 	EnableDistributedLock bool          `json:"enableDistributedLock"`
 
+	// Snapshot lease updates
+	// EnableSnapshotLeaseUpdates controls whether snapshot K8s Leases are updated after
+	// each snapshot. Set to false when etcd-druid reads EtcdMember.Status.Snapshots
+	// (UseEtcdSteward mode) to avoid unnecessary K8s API calls.
+	// Defaults to true for backward compatibility with older etcd-druid versions.
+	EnableSnapshotLeaseUpdates bool `json:"enableSnapshotLeaseUpdates"`
+
 	// Alarm
 	EnableAlarmHandler bool          `json:"enableAlarmHandler"`
 	AlarmCheckInterval time.Duration `json:"alarmCheckInterval"`
@@ -87,6 +94,7 @@ func DefaultConfig() Config {
 		DeltaSnapshotPeriod:        20 * time.Second,
 		MaxDeltaSnapshotSize:       100 * 1024 * 1024, // 100 MiB
 		MaxDeltaEvents:             1_000_000,
+		EnableSnapshotLeaseUpdates: true,
 		AlarmCheckInterval:         30 * time.Second,
 		CompactRevisionLag:         1000,
 		FullSnapshotSchedule:       "0 */24 * * *",

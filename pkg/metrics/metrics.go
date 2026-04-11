@@ -29,6 +29,8 @@ var (
 	)
 
 	// InitializationDurationSeconds measures initialization duration by path.
+	// path label is one of: "A" (restart with existing DB), "B" (scale-up learner),
+	// "C" (fresh single-node), "D" (snapshot restore), or "unknown" if classification failed.
 	InitializationDurationSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "etcd_steward",
@@ -37,6 +39,17 @@ var (
 			Buckets:   prometheus.DefBuckets,
 		},
 		[]string{"namespace", "name", "path"},
+	)
+
+	// ValidationTotal counts DB validation operations by mode and result.
+	// mode is "sanity" or "full"; result is "success" or "failure".
+	ValidationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "etcd_steward",
+			Name:      "validation_total",
+			Help:      "Total number of etcd DB validation operations, by mode and result.",
+		},
+		[]string{"namespace", "name", "mode", "result"},
 	)
 
 	// SnapshotDurationSeconds measures snapshot duration by kind.
@@ -62,6 +75,7 @@ var (
 	)
 
 	// DefragmentationDurationSeconds measures the duration of defragmentation operations.
+	// status_code is "success" or "failure". reason is "NSPACEAlarm", "Scheduled", or "Manual".
 	DefragmentationDurationSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "etcd_steward",
@@ -69,7 +83,17 @@ var (
 			Help:      "Duration of etcd defragmentation operations in seconds.",
 			Buckets:   prometheus.DefBuckets,
 		},
-		[]string{"namespace", "name", "status_code"},
+		[]string{"namespace", "name", "status_code", "reason"},
+	)
+
+	// GCSnapshotsDeletedTotal counts snapshots deleted during garbage collection.
+	GCSnapshotsDeletedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "etcd_steward",
+			Name:      "gc_snapshots_deleted_total",
+			Help:      "Total number of snapshots deleted by the garbage collector.",
+		},
+		[]string{"namespace", "name", "kind", "policy"},
 	)
 )
 
@@ -78,8 +102,10 @@ func init() {
 		ComponentHealth,
 		StateTransitionsTotal,
 		InitializationDurationSeconds,
+		ValidationTotal,
 		SnapshotDurationSeconds,
 		RestorationDurationSeconds,
 		DefragmentationDurationSeconds,
+		GCSnapshotsDeletedTotal,
 	)
 }

@@ -94,7 +94,7 @@ func TestRestorationDurationSeconds_Observe(t *testing.T) {
 }
 
 func TestDefragmentationDurationSeconds_Observe(t *testing.T) {
-	metrics.DefragmentationDurationSeconds.WithLabelValues("default", "etcd-main-0", "200").Observe(5.0)
+	metrics.DefragmentationDurationSeconds.WithLabelValues("default", "etcd-main-0", "success", "NSPACEAlarm").Observe(5.0)
 	gathered, _ := prometheus.DefaultGatherer.Gather()
 	found := false
 	for _, mf := range gathered {

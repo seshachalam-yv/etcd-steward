@@ -157,7 +157,15 @@ func (h *Handler) remediateNOSPACE(ctx context.Context, alarm *clientv3.AlarmMem
 	reason := "NSPACEAlarm"
 	startTime := metav1.Now()
 	h.logger.Info("defragmenting", zap.String("endpoint", h.endpoint))
+	defragStart := time.Now()
 	_, defragErr := h.maintenance.Defragment(ctx, h.endpoint)
+	defragDuration := time.Since(defragStart).Seconds()
+
+	statusCode := "success"
+	if defragErr != nil {
+		statusCode = "failure"
+	}
+	metrics.DefragmentationDurationSeconds.WithLabelValues(h.namespace, h.name, statusCode, reason).Observe(defragDuration)
 
 	endTime := metav1.Now()
 

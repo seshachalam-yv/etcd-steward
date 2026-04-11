@@ -24,6 +24,7 @@ type Config struct {
 
 	// Etcd connection
 	EtcdEndpoint       string `json:"etcdEndpoint"`
+	ServiceEndpoint    string `json:"serviceEndpoint"`    // ClusterIP service endpoint for scale-out detection; optional
 	EtcdPeerURL        string `json:"etcdPeerURL"`
 	InitialCluster     string `json:"initialCluster"`
 	IsSingleNode       bool   `json:"isSingleNode"`
@@ -60,9 +61,10 @@ type Config struct {
 	EnableRestoration bool `json:"enableRestoration"`
 
 	// Defrag
-	EnableDefrag          bool   `json:"enableDefrag"`
-	DefragSchedule        string `json:"defragSchedule"`
-	EnableDistributedLock bool   `json:"enableDistributedLock"`
+	EnableDefrag          bool          `json:"enableDefrag"`
+	DefragSchedule        string        `json:"defragSchedule"`
+	DefragPeriod          time.Duration `json:"defragPeriod"`
+	EnableDistributedLock bool          `json:"enableDistributedLock"`
 
 	// Alarm
 	EnableAlarmHandler bool          `json:"enableAlarmHandler"`
@@ -88,6 +90,7 @@ func DefaultConfig() Config {
 		AlarmCheckInterval:         30 * time.Second,
 		CompactRevisionLag:         1000,
 		FullSnapshotSchedule:       "0 */24 * * *",
+		DefragPeriod:               4 * time.Hour,
 	}
 }
 

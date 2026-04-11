@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
@@ -24,17 +26,22 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/gardener/etcd-steward/cmd/etcd-steward/compact"
+	"github.com/gardener/etcd-steward/cmd/etcd-steward/copybackups"
 	"github.com/gardener/etcd-steward/pkg/alarm"
 	"github.com/gardener/etcd-steward/pkg/compression"
 	"github.com/gardener/etcd-steward/pkg/config"
+	"github.com/gardener/etcd-steward/pkg/defrag"
 	"github.com/gardener/etcd-steward/pkg/etcdclient"
 	"github.com/gardener/etcd-steward/pkg/gc"
 	"github.com/gardener/etcd-steward/pkg/initializer"
 	"github.com/gardener/etcd-steward/pkg/leaderwatch"
 	"github.com/gardener/etcd-steward/pkg/lease"
+	"github.com/gardener/etcd-steward/pkg/lock"
 	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/server"
 	"github.com/gardener/etcd-steward/pkg/snapshotter"
+	"github.com/gardener/etcd-steward/pkg/snapshotlease"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
 	"github.com/gardener/etcd-steward/pkg/statemachine"
 	"github.com/gardener/etcd-steward/pkg/validator"
@@ -68,6 +75,7 @@ func main() {
 
 	fs.IntVar(&cfg.ServerPort, "server-port", cfg.ServerPort, "HTTP server port")
 	fs.StringVar(&cfg.EtcdEndpoint, "endpoints", "", "etcd client endpoint URL")
+	fs.StringVar(&cfg.ServiceEndpoint, "service-endpoints", "", "etcd ClusterIP service endpoint URL for scale-out cluster detection (optional)")
 	fs.StringVar(&cfg.InitialCluster, "initial-cluster", "", "etcd initial-cluster string (name=url,...)")
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "etcd data directory")
 	// Peer URL is derived from initial-cluster + POD_NAME; also accept explicit flag.
@@ -271,6 +279,29 @@ func main() {
 	memberClient := member.NewK8sClient(dynamicClient)
 	clusterClient := etcdclient.NewClusterClient(etcdClient)
 
+	// Build service cluster client if a ClusterIP service endpoint is configured.
+	// This client connects to the cluster-level service (e.g. test-client:2379) and is used
+	// during scale-out to detect the existing cluster without requiring the local etcd to be up.
+	var serviceClusterClient etcdclient.ClusterClient
+	if cfg.ServiceEndpoint != "" {
+		serviceClientCfg := clientv3.Config{
+			Endpoints:   []string{cfg.ServiceEndpoint},
+			DialTimeout: 5 * time.Second,
+		}
+		// Reuse TLS config from local client.
+		serviceClientCfg.TLS = etcdClientCfg.TLS
+		serviceEtcdClient, err := clientv3.New(serviceClientCfg)
+		if err != nil {
+			logger.Warn("failed to create service cluster client, scale-out detection may not work",
+				zap.String("serviceEndpoint", cfg.ServiceEndpoint),
+				zap.Error(err),
+			)
+		} else {
+			defer serviceEtcdClient.Close() //nolint:errcheck
+			serviceClusterClient = etcdclient.NewClusterClient(serviceEtcdClient)
+		}
+	}
+
 	// Determine validation mode.
 	valMode := validator.DetermineMode(cfg.DataDir)
 
@@ -306,10 +337,22 @@ func main() {
 		store,
 		comp,
 	)
+	// Inject the etcd status client so GetMemberAndClusterID can return real IDs.
+	// etcdClient implements the maintenance.Status() call used by EtcdStatusAPI.
+	init.SetEtcdStatusAPI(&etcdStatusAdapter{client: etcdClient})
+	// Inject service cluster client for scale-out detection (if configured).
+	if serviceClusterClient != nil {
+		init.SetServiceClusterClient(serviceClusterClient, cfg.ServiceEndpoint)
+	}
 
 	// Build snapshotter (if backup configured).
 	var snap *snapshotter.Snapshotter
 	if store != nil {
+		var snapshotLock *lock.Lock
+		if cfg.EnableDistributedLock {
+			snapshotLock = lock.New(etcdClient, cfg.PodNamespace, cfg.EtcdName+"-snapshot")
+		}
+		leaseUpdater := snapshotlease.New(cfg.EtcdName, cfg.PodNamespace, k8sClientset.CoordinationV1(), logger.Named("snapshotlease"))
 		snap = snapshotter.New(
 			store, comp,
 			cfg.EtcdName, cfg.PodNamespace,
@@ -317,6 +360,8 @@ func main() {
 			func() bool {
 				return !init.IsLearner()
 			},
+			snapshotLock,
+			leaseUpdater,
 			logger.Named("snapshotter"),
 		)
 	}
@@ -326,11 +371,29 @@ func main() {
 	// When etcd-druid mounts the config at /var/etcd/config/etcd.conf.yaml, we process it:
 	// per-member fields (advertise-client-urls, initial-advertise-peer-urls) are keyed by member
 	// name; we extract the value for our pod name and flatten to a string.
+	// When the member is joining an existing cluster (scale-out or data-loss recovery),
+	// initial-cluster-state is overridden to "existing" so etcd joins the cluster as a
+	// learner instead of bootstrapping a new cluster.
 	const etcdConfigFilePath = "/var/etcd/config/etcd.conf.yaml"
 	configFn := func() ([]byte, error) {
+		clusterState := "new"
+		var initialClusterOverride string
+		if init.NeedsExistingClusterState() {
+			clusterState = "existing"
+			// When joining an existing cluster, initial-cluster must contain only the
+			// current cluster members (not all planned replicas). etcd validates that the
+			// count of initial-cluster entries equals the actual cluster member count.
+			//
+			// Build the name→peerURL map from the ConfigMap's initial-cluster field.
+			// These are the authoritative final URLs (e.g. https:// after TLS migration).
+			configMapEntries := buildPeerURLMap(cfg.InitialCluster)
+			configCtx, configCancel := context.WithTimeout(ctx, 15*time.Second)
+			initialClusterOverride = init.GetCurrentMembersInitialCluster(configCtx, configMapEntries)
+			configCancel()
+		}
 		raw, err := os.ReadFile(etcdConfigFilePath)
 		if err == nil {
-			return processEtcdConfig(raw, cfg.PodName)
+			return processEtcdConfig(raw, cfg.PodName, clusterState, initialClusterOverride)
 		}
 		// Fallback: build minimal config from CLI flags (used in tests / non-druid deployments).
 		advertisePeerURLs := cfg.EtcdPeerURL
@@ -348,9 +411,13 @@ func main() {
 		// Use only the first URL from listen-client-urls to avoid "address already in use" when
 		// the flag contains both 0.0.0.0:port and 127.0.0.1:port (0.0.0.0 already covers all).
 		lcu := firstURL(capturedListenClientURLs, "http://localhost:2379")
+		initialCluster := cfg.InitialCluster
+		if initialClusterOverride != "" {
+			initialCluster = initialClusterOverride
+		}
 		yamlContent := fmt.Sprintf(
-			"name: %s\ndata-dir: %s\ninitial-cluster: %s\ninitial-advertise-peer-urls: %s\nadvertise-client-urls: %s\nlisten-peer-urls: %s\nlisten-client-urls: %s\n",
-			cfg.PodName, cfg.DataDir, cfg.InitialCluster,
+			"name: %s\ndata-dir: %s\ninitial-cluster: %s\ninitial-cluster-state: %s\ninitial-advertise-peer-urls: %s\nadvertise-client-urls: %s\nlisten-peer-urls: %s\nlisten-client-urls: %s\n",
+			cfg.PodName, cfg.DataDir, initialCluster, clusterState,
 			advertisePeerURLs, advertiseClientURLs,
 			lpu, lcu,
 		)
@@ -406,6 +473,19 @@ func main() {
 	// peerTLSEnabled is true when the peer URL uses the https scheme.
 	// Used both for lease annotation and EtcdMember status.
 	peerTLSEnabled := strings.HasPrefix(cfg.EtcdPeerURL, "https://")
+
+	// Peer URL reconciler: after etcd starts, update the cluster membership record if our
+	// registered peer URL differs from the configured one. This can happen when TLS is enabled
+	// on an existing member — etcd does NOT auto-update the advertised peer URL in the cluster
+	// membership when restarting with a new initial-advertise-peer-urls. Without this, new members
+	// joining after TLS migration will see the stale http:// URL and fail to connect.
+	if cfg.EtcdPeerURL != "" && !cfg.IsSingleNode {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reconcilePeerURL(ctx, cfg.EtcdPeerURL, clusterClient, init, logger)
+		}()
+	}
 
 	// Member lease renewal.
 	if cfg.EnableMemberLeaseRenewal {
@@ -489,6 +569,52 @@ func main() {
 		}()
 	}
 
+	// Defragmentation (Option-3: leader-orchestrated via etcd keys).
+	if cfg.EnableDefrag {
+		defragOrchestrator := defrag.NewOrchestrator(
+			etcdClient,
+			etcdClient,
+			cfg.PodNamespace, cfg.EtcdName,
+			cfg.EtcdEndpoint,
+			logger.Named("defrag-orchestrator"),
+		)
+		statusReconciler.RegisterProvider("defrag-orchestrator", defragOrchestrator)
+
+		defragParticipant := defrag.NewParticipant(
+			etcdClient,
+			etcdClient,
+			cfg.PodNamespace, cfg.EtcdName,
+			cfg.PodName,
+			cfg.EtcdEndpoint,
+			logger.Named("defrag-participant"),
+		)
+		statusReconciler.RegisterProvider("defrag-participant", defragParticipant)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defragParticipant.Run(ctx)
+		}()
+
+		// Orchestrator runs only on leader; it discovers member names from clusterClient.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			getMemberNames := func(ctx context.Context) ([]string, error) {
+				members, err := clusterClient.ListMembers(ctx)
+				if err != nil {
+					return nil, err
+				}
+				names := make([]string, 0, len(members))
+				for _, m := range members {
+					names = append(names, m.Name)
+				}
+				return names, nil
+			}
+			defragOrchestrator.Run(ctx, cfg.PodName, getMemberNames, cfg.DefragPeriod)
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -540,9 +666,95 @@ func derivePeerURL(podName, initialCluster string) string {
 	return ""
 }
 
+// buildPeerURLMap parses an initial-cluster string ("name=url,...") into a
+// name → peerURL map. Used to supply authoritative ConfigMap URLs to
+// GetCurrentMembersInitialCluster when the live cluster may show stale URLs
+// (e.g. during a TLS migration that changes http:// to https://).
+func buildPeerURLMap(initialCluster string) map[string]string {
+	m := make(map[string]string)
+	for _, part := range splitComma(initialCluster) {
+		idx := indexByte(part, '=')
+		if idx < 0 {
+			continue
+		}
+		m[part[:idx]] = part[idx+1:]
+	}
+	return m
+}
+
+// reconcilePeerURL waits for initialization to complete, then checks whether this member's
+// registered peer URL in the cluster matches cfg.EtcdPeerURL. If they differ (e.g. after
+// enabling peer TLS: registered=http:// but configured=https://), it calls MemberUpdate to fix
+// the cluster membership record. Without this, new members joining after TLS migration would
+// use the stale http:// URL from initial-cluster and fail to connect.
+func reconcilePeerURL(ctx context.Context, configuredPeerURL string, cc etcdclient.ClusterClient, init *initializer.Initializer, logger *zap.Logger) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// Wait until initialization is complete and etcd is running.
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if init.GetStatus() == initializer.InitializationStatusSuccessful {
+				goto ready
+			}
+		}
+	}
+ready:
+	// Strip scheme for comparison (http vs https).
+	normURL := func(u string) string {
+		if idx := strings.Index(u, "://"); idx >= 0 {
+			return u[idx+3:]
+		}
+		return u
+	}
+	normConfigured := normURL(configuredPeerURL)
+
+	// Retry a few times in case etcd is still starting.
+	for attempt := 0; attempt < 10; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		members, err := cc.ListMembers(listCtx)
+		cancel()
+		if err != nil {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		for _, m := range members {
+			for _, u := range m.PeerURLs {
+				if normURL(u) == normConfigured && u != configuredPeerURL {
+					// Found our member with a stale URL (different scheme). Update it.
+					logger.Info("updating stale peer URL in cluster membership",
+						zap.String("from", u),
+						zap.String("to", configuredPeerURL),
+						zap.Uint64("memberID", m.ID),
+					)
+					updateCtx, updateCancel := context.WithTimeout(ctx, 10*time.Second)
+					updateErr := cc.UpdateMemberPeerURL(updateCtx, m.ID, configuredPeerURL)
+					updateCancel()
+					if updateErr != nil {
+						logger.Warn("failed to update peer URL", zap.Error(updateErr))
+					}
+					return
+				}
+				if u == configuredPeerURL {
+					// Already correct.
+					return
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // countClusterMembers counts the number of members in initial-cluster.
-func countClusterMembers(initialCluster string) int {
-	if initialCluster == "" {
+func countClusterMembers(initialCluster string) int {	if initialCluster == "" {
 		return 0
 	}
 	return len(splitComma(initialCluster))
@@ -574,13 +786,37 @@ func indexByte(s string, b byte) int {
 }
 
 func runCompact(logger *zap.Logger) {
-	logger.Info("compact subcommand not yet fully implemented")
-	os.Exit(0)
+	// Parse compact-specific args (skip "compact" token at index 0).
+	args := os.Args[2:]
+	opts, err := compact.ParseArgs(args)
+	if err != nil {
+		logger.Fatal("compact: invalid arguments", zap.Error(err))
+	}
+
+	// Start a minimal HTTP server exposing /metrics so Prometheus can scrape job metrics.
+	metricsSrv := startMetricsOnlyServer(logger, 8080)
+	defer metricsSrv.Shutdown(context.Background()) //nolint:errcheck
+
+	if err := compact.Run(logger, opts); err != nil {
+		logger.Fatal("compact failed", zap.Error(err))
+	}
 }
 
 func runCopyBackups(logger *zap.Logger) {
-	logger.Info("copy-backups subcommand not yet fully implemented")
-	os.Exit(0)
+	// Parse copy-backups-specific args (skip "copy-backups" token at index 0).
+	args := os.Args[2:]
+	opts, err := copybackups.ParseArgs(args)
+	if err != nil {
+		logger.Fatal("copy-backups: invalid arguments", zap.Error(err))
+	}
+
+	// Start a minimal HTTP server exposing /metrics so Prometheus can scrape job metrics.
+	metricsSrv := startMetricsOnlyServer(logger, 8080)
+	defer metricsSrv.Shutdown(context.Background()) //nolint:errcheck
+
+	if err := copybackups.Run(logger, opts); err != nil {
+		logger.Fatal("copy-backups failed", zap.Error(err))
+	}
 }
 
 // firstURL returns the first comma-separated URL from urls, or fallback if urls is empty.
@@ -595,6 +831,30 @@ func firstURL(urls, fallback string) string {
 	return urls[:idx]
 }
 
+// startMetricsOnlyServer starts a minimal HTTP server that serves only /metrics on the
+// given port. It is used by the compact and copy-backups subcommands so that Prometheus
+// can scrape job-level metrics even from short-lived one-shot processes.
+// The returned *http.Server must be shut down by the caller.
+func startMetricsOnlyServer(logger *zap.Logger, port int) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	addr := fmt.Sprintf(":%d", port)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		logger.Info("starting metrics server", zap.String("addr", addr))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server error", zap.Error(err))
+		}
+	}()
+
+	return srv
+}
+
 // processEtcdConfig converts the druid-generated ConfigMap YAML to a flat etcd config YAML.
 //
 // etcd-druid generates a ConfigMap with per-member maps for certain fields:
@@ -605,7 +865,11 @@ func firstURL(urls, fallback string) string {
 //
 // embed.ConfigFromFile expects a flat scalar for these fields. This function extracts the
 // value for memberName and rewrites those fields as flat comma-joined strings.
-func processEtcdConfig(raw []byte, memberName string) ([]byte, error) {
+// clusterState overrides the initial-cluster-state field ("new" or "existing").
+// initialClusterOverride, when non-empty, replaces the initial-cluster field. This is used
+// when joining an existing cluster (learner mode) so the field contains only the current
+// cluster members instead of all planned replicas.
+func processEtcdConfig(raw []byte, memberName, clusterState, initialClusterOverride string) ([]byte, error) {
 	// Parse YAML into a generic map.
 	var cfg map[string]interface{}
 	if err := unmarshalYAML(raw, &cfg); err != nil {
@@ -653,6 +917,36 @@ func processEtcdConfig(raw []byte, memberName string) ([]byte, error) {
 	// Set name to the actual member name (druid uses "etcd-config" as placeholder).
 	cfg["name"] = memberName
 
+	// Override initial-cluster when joining an existing cluster (learner mode).
+	// The ConfigMap lists all planned replicas, but etcd validates that initial-cluster
+	// count matches actual cluster member count — so we must provide only current members.
+	if initialClusterOverride != "" {
+		cfg["initial-cluster"] = initialClusterOverride
+	}
+
+	// Override initial-cluster-state: etcd-druid always writes "new" in the ConfigMap,
+	// but when a member is joining an existing cluster (scale-out or data-loss recovery)
+	// we must use "existing" so etcd joins rather than bootstrapping a fresh cluster.
+	cfg["initial-cluster-state"] = clusterState
+
 	// Re-marshal to YAML.
 	return marshalYAML(cfg)
+}
+
+// etcdStatusAdapter adapts *clientv3.Client to initializer.EtcdStatusAPI.
+// clientv3.Maintenance.Status returns *clientv3.StatusResponse; the initializer
+// interface expects *initializer.EtcdStatusResponse with just MemberID/ClusterID.
+type etcdStatusAdapter struct {
+	client *clientv3.Client
+}
+
+func (a *etcdStatusAdapter) Status(ctx context.Context, endpoint string) (*initializer.EtcdStatusResponse, error) {
+	resp, err := a.client.Status(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &initializer.EtcdStatusResponse{
+		MemberID:  resp.Header.MemberId,
+		ClusterID: resp.Header.ClusterId,
+	}, nil
 }

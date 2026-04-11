@@ -58,6 +58,9 @@ func (n *noopClusterClient) WasMemberInCluster(_ context.Context, _ string) (boo
 	return false, nil
 }
 func (n *noopClusterClient) RemoveStaleMember(_ context.Context, _ string) error { return nil }
+func (n *noopClusterClient) UpdateMemberPeerURL(_ context.Context, _ uint64, _ string) error {
+	return nil
+}
 
 // newTestServer creates a Server listening on a free OS-assigned port.
 // Returns the server, its base URL, and a cancel func to shut it down.

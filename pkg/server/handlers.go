@@ -85,13 +85,19 @@ func NewServerWithTLS(
 
 // registerRoutes registers all HTTP handlers on the mux.
 func (s *Server) registerRoutes() {
-	s.mux.HandleFunc("/config", s.handleConfig)
-	s.mux.HandleFunc("/initialization/start", s.handleInitializationStart)
-	s.mux.HandleFunc("/initialization/status", s.handleInitializationStatus)
-	s.mux.HandleFunc("/snapshot/full", s.handleSnapshotFull)
-	s.mux.HandleFunc("/snapshot/delta", s.handleSnapshotDelta)
-	s.mux.HandleFunc("/snapshot/latest", s.handleSnapshotLatest)
-	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	wrap := func(path string, h http.HandlerFunc) {
+		s.mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			s.logger.Info("HTTP request received", zap.String("method", r.Method), zap.String("path", r.URL.Path))
+			h(w, r)
+		})
+	}
+	wrap("/config", s.handleConfig)
+	wrap("/initialization/start", s.handleInitializationStart)
+	wrap("/initialization/status", s.handleInitializationStatus)
+	wrap("/snapshot/full", s.handleSnapshotFull)
+	wrap("/snapshot/delta", s.handleSnapshotDelta)
+	wrap("/snapshot/latest", s.handleSnapshotLatest)
+	wrap("/healthz", s.handleHealthz)
 	s.mux.Handle("/metrics", promhttp.Handler())
 }
 
@@ -210,7 +216,7 @@ func (s *Server) handleInitializationStatus(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleSnapshotFull(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -233,7 +239,7 @@ func (s *Server) handleSnapshotFull(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSnapshotDelta(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}

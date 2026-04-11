@@ -126,7 +126,7 @@ initial-advertise-peer-urls:
 data-dir: /var/etcd/data
 `)
 
-	out, err := processEtcdConfig(raw, "etcd-0")
+	out, err := processEtcdConfig(raw, "etcd-0", "new", "")
 	if err != nil {
 		t.Fatalf("processEtcdConfig error: %v", err)
 	}
@@ -151,7 +151,7 @@ advertise-client-urls: https://etcd-0.etcd-client:2379
 data-dir: /var/etcd/data
 `)
 
-	out, err := processEtcdConfig(raw, "etcd-0")
+	out, err := processEtcdConfig(raw, "etcd-0", "new", "")
 	if err != nil {
 		t.Fatalf("processEtcdConfig error: %v", err)
 	}
@@ -169,7 +169,7 @@ advertise-client-urls:
     - https://etcd-0.etcd-client:2379
 `)
 
-	out, err := processEtcdConfig(raw, "etcd-99")
+	out, err := processEtcdConfig(raw, "etcd-99", "new", "")
 	if err != nil {
 		t.Fatalf("processEtcdConfig error: %v", err)
 	}
@@ -188,7 +188,7 @@ advertise-client-urls:
     - https://10.0.0.1:2379
 `)
 
-	out, err := processEtcdConfig(raw, "etcd-0")
+	out, err := processEtcdConfig(raw, "etcd-0", "new", "")
 	if err != nil {
 		t.Fatalf("processEtcdConfig error: %v", err)
 	}
@@ -209,12 +209,37 @@ name: etcd-config
 data-dir: /var/etcd/data
 `)
 
-	out, err := processEtcdConfig(raw, "etcd-main-1")
+	out, err := processEtcdConfig(raw, "etcd-main-1", "new", "")
 	if err != nil {
 		t.Fatalf("processEtcdConfig error: %v", err)
 	}
 	if !strings.Contains(string(out), "name: etcd-main-1") {
 		t.Errorf("expected name to be overwritten to 'etcd-main-1', got:\n%s", out)
+	}
+}
+
+func TestProcessEtcdConfig_InitialClusterOverride(t *testing.T) {
+	// When initialClusterOverride is non-empty, initial-cluster should be replaced.
+	// This is used when joining as a learner so only current cluster members are listed.
+	raw := []byte(`
+initial-cluster: etcd-0=https://etcd-0.etcd-peer:2380,etcd-1=https://etcd-1.etcd-peer:2380,etcd-2=https://etcd-2.etcd-peer:2380
+data-dir: /var/etcd/data
+`)
+
+	override := "etcd-0=https://etcd-0.etcd-peer:2380,etcd-1=https://etcd-1.etcd-peer:2380"
+	out, err := processEtcdConfig(raw, "etcd-1", "existing", override)
+	if err != nil {
+		t.Fatalf("processEtcdConfig error: %v", err)
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "etcd-2") {
+		t.Errorf("expected etcd-2 to be absent (overridden), got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "etcd-0=https://etcd-0.etcd-peer:2380") {
+		t.Errorf("expected etcd-0 in override, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "initial-cluster-state: existing") {
+		t.Errorf("expected initial-cluster-state: existing, got:\n%s", outStr)
 	}
 }
 

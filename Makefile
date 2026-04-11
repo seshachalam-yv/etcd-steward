@@ -23,6 +23,10 @@ check: $(GOLANGCI_LINT)
 test:
 	@go test -count=1 -race ./pkg/... ./cmd/...
 
+.PHONY: test-integration
+test-integration:
+	@go test -count=1 -tags integration -v ./pkg/snapstore/...
+
 .PHONY: add-license-headers
 add-license-headers: $(GO_ADD_LICENSE)
 	@./hack/add_license_headers.sh

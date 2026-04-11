@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
@@ -21,10 +22,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gardener/etcd-steward/pkg/compression"
+	"github.com/gardener/etcd-steward/pkg/lock"
 	"github.com/gardener/etcd-steward/pkg/member"
 	"github.com/gardener/etcd-steward/pkg/metrics"
 	"github.com/gardener/etcd-steward/pkg/snapstore"
 )
+
+// SnapshotLeaseUpdater is the interface for updating snapshot revision leases.
+// Implemented by snapshotlease.Updater; nil disables lease updates.
+type SnapshotLeaseUpdater interface {
+	UpdateFullSnapshotLease(ctx context.Context, revision int64) error
+	UpdateDeltaSnapshotLease(ctx context.Context, revision int64) error
+}
 
 // ErrNotLeader is returned when a snapshot is attempted on a non-leader member.
 var ErrNotLeader = errors.New("not leader, skipping snapshot")
@@ -48,18 +57,14 @@ type EtcdStatusAPI interface {
 	Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error)
 }
 
-// CronScheduler parses cron expressions and provides a channel that fires at scheduled times.
-// This is a simplified interface — for production, a proper cron library would be used.
-type CronScheduler interface {
-	Next(from time.Time) time.Time
-}
-
 // Snapshotter manages the full and delta snapshot pipeline.
 type Snapshotter struct {
-	store      snapstore.Snapstore
-	compressor compression.Compressor
-	etcdName   string
-	namespace  string
+	store        snapstore.Snapstore
+	compressor   compression.Compressor
+	etcdName     string
+	namespace    string
+	snapshotLock *lock.Lock          // optional distributed lock; nil means no distributed exclusion
+	leaseUpdater SnapshotLeaseUpdater // optional; nil disables snapshot lease updates
 
 	snapshotAPI EtcdSnapshotAPI
 	watchAPI    EtcdWatchAPI
@@ -75,6 +80,8 @@ type Snapshotter struct {
 }
 
 // New creates a Snapshotter with the given dependencies.
+// snapshotLock is optional; pass nil to disable distributed mutual exclusion.
+// leaseUpdater is optional; pass nil to disable snapshot lease updates.
 func New(
 	store snapstore.Snapstore,
 	compressor compression.Compressor,
@@ -83,26 +90,42 @@ func New(
 	watchAPI EtcdWatchAPI,
 	kvAPI EtcdStatusAPI,
 	isLeader func() bool,
+	snapshotLock *lock.Lock,
+	leaseUpdater SnapshotLeaseUpdater,
 	logger *zap.Logger,
 ) *Snapshotter {
 	return &Snapshotter{
-		store:       store,
-		compressor:  compressor,
-		etcdName:    etcdName,
-		namespace:   namespace,
-		snapshotAPI: snapshotAPI,
-		watchAPI:    watchAPI,
-		kvAPI:       kvAPI,
-		isLeader:    isLeader,
-		logger:      logger,
+		store:        store,
+		compressor:   compressor,
+		etcdName:     etcdName,
+		namespace:    namespace,
+		snapshotLock: snapshotLock,
+		leaseUpdater: leaseUpdater,
+		snapshotAPI:  snapshotAPI,
+		watchAPI:     watchAPI,
+		kvAPI:        kvAPI,
+		isLeader:     isLeader,
+		logger:       logger,
 	}
 }
 
 // TriggerFullSnapshot takes a full etcd snapshot and saves it to the snapstore.
 // Returns ErrNotLeader if this member is not the leader.
+// If a distributed snapshotLock was provided, it is acquired before taking the snapshot
+// and released afterwards to ensure only one member snapshots at a time (Cases 1/2/3 from design notes).
 func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*snapstore.Snapshot, error) {
 	if !s.isLeader() {
 		return nil, ErrNotLeader
+	}
+
+	// Acquire distributed lock if configured (mutual exclusion across leadership changes).
+	if s.snapshotLock != nil {
+		if err := s.snapshotLock.Acquire(ctx); err != nil {
+			return nil, fmt.Errorf("failed to acquire snapshot lock: %w", err)
+		}
+		defer func() { //nolint:errcheck
+			_ = s.snapshotLock.Release(context.Background())
+		}()
 	}
 
 	start := time.Now()
@@ -187,6 +210,13 @@ func (s *Snapshotter) TriggerFullSnapshot(ctx context.Context, isFinal bool) (*s
 		zap.Bool("isFinal", isFinal),
 	)
 
+	// Update the full snapshot lease so etcd-druid knows the latest backed-up revision.
+	if s.leaseUpdater != nil {
+		if leaseErr := s.leaseUpdater.UpdateFullSnapshotLease(ctx, currentRev); leaseErr != nil {
+			s.logger.Error("failed to update full snapshot lease", zap.Error(leaseErr))
+		}
+	}
+
 	return &snap, nil
 }
 
@@ -207,11 +237,26 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 		return nil, ErrNoFullSnapshot
 	}
 
+	// Get the current revision before watching so we know when we've seen all
+	// existing events. We break the watch as soon as we've caught up to this
+	// revision, avoiding the full 30-second context timeout.
+	currentRev, err := s.getCurrentRevision(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current revision for delta: %w", err)
+	}
+
 	// Watch from startRev+1 to collect events.
+	// Use a generous 30s timeout as an upper bound; we break early once caught up.
 	watchCtx, watchCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer watchCancel()
 
-	wch := s.watchAPI.Watch(watchCtx, "", clientv3.WithPrefix(), clientv3.WithRev(startRev+1))
+	s.logger.Info("delta snapshot: starting watch",
+		zap.Int64("startRev", startRev),
+		zap.Int64("watchFromRev", startRev+1),
+		zap.Int64("currentRev", currentRev),
+	)
+
+	wch := s.watchAPI.Watch(watchCtx, "\x00", clientv3.WithFromKey(), clientv3.WithRev(startRev+1), clientv3.WithProgressNotify())
 
 	var allEvents []DeltaEvent
 	var lastRev int64
@@ -222,6 +267,7 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 
 	for watchResp := range wch {
 		if watchResp.Err() != nil {
+			s.logger.Warn("delta snapshot: watch error", zap.Error(watchResp.Err()))
 			break
 		}
 		for _, ev := range watchResp.Events {
@@ -251,6 +297,13 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 		if eventCount >= maxDeltaEvents || rawSize >= maxDeltaSize {
 			break
 		}
+
+		// Break early once the watch has delivered all events up to currentRev.
+		// watchResp.Header.Revision reflects the cluster revision at the time
+		// etcd sent this batch; when it reaches currentRev we've seen everything.
+		if watchResp.Header.Revision >= currentRev {
+			break
+		}
 	}
 
 	// Re-read lastFullRevision under lock. A concurrent TriggerFullSnapshot may have
@@ -262,6 +315,13 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	if effectiveStartRev < startRev {
 		effectiveStartRev = startRev
 	}
+
+	s.logger.Info("delta snapshot: watch complete",
+		zap.Int("allEventsCount", len(allEvents)),
+		zap.Int64("startRev", startRev),
+		zap.Int64("effectiveStartRev", effectiveStartRev),
+		zap.Int64("lastRev", lastRev),
+	)
 
 	var events bytes.Buffer
 	var filteredCount int64
@@ -309,6 +369,13 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 		return nil, fmt.Errorf("failed to save delta snapshot: %w", err)
 	}
 
+	// Update the delta snapshot lease so etcd-druid knows the latest delta-backed revision.
+	if s.leaseUpdater != nil {
+		if leaseErr := s.leaseUpdater.UpdateDeltaSnapshotLease(ctx, lastRev); leaseErr != nil {
+			s.logger.Error("failed to update delta snapshot lease", zap.Error(leaseErr))
+		}
+	}
+
 	deltaSize := int64(events.Len())
 	s.mu.Lock()
 	s.lastRevision = lastRev
@@ -339,30 +406,36 @@ func (s *Snapshotter) TriggerDeltaSnapshot(ctx context.Context) (*snapstore.Snap
 	return &snap, nil
 }
 
-// RunFullSnapshotSchedule runs TriggerFullSnapshot on a simple periodic schedule.
-// For Phase 2, this uses a fixed interval parsed from the schedule string.
-// A real cron parser would be used in production.
+// RunFullSnapshotSchedule runs TriggerFullSnapshot on the given cron schedule until ctx is cancelled.
+// schedule must be a standard 5-field cron expression (e.g. "0 */24 * * *").
+// An initial full snapshot is taken immediately before the first scheduled tick.
 func (s *Snapshotter) RunFullSnapshotSchedule(ctx context.Context, schedule string) {
-	// Parse schedule as a simple interval. Default to 24h.
-	interval := 24 * time.Hour
-
-	s.logger.Info("starting full snapshot schedule", zap.String("schedule", schedule), zap.Duration("interval", interval))
-
-	// Take an initial full snapshot immediately.
-	if _, err := s.TriggerFullSnapshot(ctx, false); err != nil && !errors.Is(err, ErrNotLeader) {
-		s.logger.Error("initial full snapshot failed", zap.Error(err))
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	parsed, err := parser.Parse(schedule)
+	if err != nil {
+		s.logger.Error("invalid full snapshot schedule, falling back to 24h interval",
+			zap.String("schedule", schedule), zap.Error(err))
+		parsed, _ = parser.Parse("0 0 * * *") // midnight daily fallback
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	s.logger.Info("starting full snapshot schedule", zap.String("schedule", schedule))
+
+	// Take an initial full snapshot immediately.
+	if _, trigErr := s.TriggerFullSnapshot(ctx, false); trigErr != nil && !errors.Is(trigErr, ErrNotLeader) {
+		s.logger.Error("initial full snapshot failed", zap.Error(trigErr))
+	}
 
 	for {
+		now := time.Now()
+		nextRun := parsed.Next(now)
+		wait := time.Until(nextRun)
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if _, err := s.TriggerFullSnapshot(ctx, false); err != nil && !errors.Is(err, ErrNotLeader) {
-				s.logger.Error("scheduled full snapshot failed", zap.Error(err))
+		case <-time.After(wait):
+			if _, trigErr := s.TriggerFullSnapshot(ctx, false); trigErr != nil && !errors.Is(trigErr, ErrNotLeader) {
+				s.logger.Error("scheduled full snapshot failed", zap.Error(trigErr))
 			}
 		}
 	}

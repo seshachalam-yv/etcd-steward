@@ -102,6 +102,8 @@ func TestRunDeltaSnapshotLoop_CancelledImmediately(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 1},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -130,6 +132,8 @@ func TestRunDeltaSnapshotLoop_ErrNotLeaderSilent(_ *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 1},
 		func() bool { return false }, // not leader
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -150,6 +154,8 @@ func TestRunDeltaSnapshotLoop_ErrNoFullSnapshot_Silent(_ *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 1},
 		func() bool { return true }, // is leader
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -169,6 +175,8 @@ func TestRunFullSnapshotSchedule_CancelledImmediately(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 5},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -200,6 +208,8 @@ func TestTriggerFullSnapshot_Success(t *testing.T) {
 		&fakeWatchAPI{},
 		kvAPI,
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -231,6 +241,8 @@ func TestTriggerFullSnapshot_NotLeader(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 100},
 		func() bool { return false },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -269,6 +281,8 @@ func TestTriggerDeltaSnapshot_Success(t *testing.T) {
 		&fakeWatchAPI{events: events},
 		&fakeStatusAPI{revision: 42},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -303,6 +317,8 @@ func TestTriggerDeltaSnapshot_NotLeader(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{},
 		func() bool { return false },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 	s.lastRevision = 10
@@ -322,6 +338,8 @@ func TestTriggerDeltaSnapshot_NoFullSnapshotYet(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 	// lastRevision is 0 (no full snapshot taken).
@@ -341,6 +359,8 @@ func TestTriggerDeltaSnapshot_NoEvents(t *testing.T) {
 		&fakeWatchAPI{events: nil}, // No events.
 		&fakeStatusAPI{},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 	s.lastRevision = 42
@@ -367,6 +387,8 @@ func TestTriggerFullSnapshot_UpdatesLastRevision(t *testing.T) {
 		&fakeWatchAPI{},
 		kvAPI,
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -393,6 +415,8 @@ func TestProvideInfo_BeforeAnySnapshot(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 10},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -411,6 +435,8 @@ func TestProvideInfo_AfterFullSnapshot(t *testing.T) {
 		&fakeWatchAPI{},
 		&fakeStatusAPI{revision: 42},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -453,6 +479,8 @@ func TestProvideInfo_FullThenDelta_DeltaAccumulates(t *testing.T) {
 		&fakeWatchAPI{events: events},
 		&fakeStatusAPI{revision: 42},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -497,6 +525,8 @@ func TestProvideInfo_FullAfterDelta_ResetsAccumulation(t *testing.T) {
 		&fakeWatchAPI{events: events},
 		&fakeStatusAPI{revision: 42},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -545,6 +575,8 @@ func TestTriggerDeltaSnapshot_FiltersEventsAlreadyCoveredByFullSnapshot(t *testi
 		&fakeWatchAPI{events: events},
 		&fakeStatusAPI{revision: 44},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 
@@ -594,6 +626,8 @@ func TestTriggerDeltaSnapshot_AllEventsFilteredByFullSnapshot(t *testing.T) {
 		&fakeWatchAPI{events: events},
 		&fakeStatusAPI{revision: 45},
 		func() bool { return true },
+		nil,
+		nil,
 		zap.NewNop(),
 	)
 

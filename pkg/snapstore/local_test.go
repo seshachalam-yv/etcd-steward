@@ -291,12 +291,8 @@ func TestNewSnapstore_Local(t *testing.T) {
 }
 
 func TestNewSnapstore_UnsupportedProviders(t *testing.T) {
-	for _, provider := range []string{"S3", "GCS", "ABS"} {
-		t.Run(provider, func(t *testing.T) {
-			_, err := NewSnapstore(SnapstoreConfig{Provider: provider})
-			if err == nil {
-				t.Errorf("NewSnapstore(provider=%q) expected error, got nil", provider)
-			}
-		})
+	_, err := NewSnapstore(SnapstoreConfig{Provider: "UNKNOWN_PROVIDER_XYZ"})
+	if err == nil {
+		t.Error("NewSnapstore(provider=UNKNOWN_PROVIDER_XYZ) expected error, got nil")
 	}
 }

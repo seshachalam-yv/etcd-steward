@@ -73,6 +73,11 @@ func (l *LocalSnapstore) Fetch(snap Snapshot) (io.ReadCloser, error) {
 
 // List returns all snapshots in the store, sorted by LastRevision ascending.
 func (l *LocalSnapstore) List() ([]Snapshot, error) {
+	// If the base directory does not exist, treat it as an empty store.
+	if _, err := os.Stat(l.baseDir); os.IsNotExist(err) {
+		return nil, nil
+	}
+
 	var snapshots []Snapshot
 
 	err := filepath.Walk(l.baseDir, func(path string, info os.FileInfo, err error) error {

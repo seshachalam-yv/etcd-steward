@@ -7,6 +7,7 @@ package snapstore
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -49,17 +50,20 @@ type SnapstoreConfig struct { //nolint:revive // name intentionally includes pac
 }
 
 // NewSnapstore creates a Snapstore for the given configuration.
-// Currently only the "Local" provider is supported.
 func NewSnapstore(cfg SnapstoreConfig) (Snapstore, error) {
 	switch cfg.Provider {
 	case "Local", "local", "":
-		return NewLocal(cfg.Container), nil
+		baseDir := cfg.Container
+		if cfg.Prefix != "" {
+			baseDir = filepath.Join(baseDir, cfg.Prefix)
+		}
+		return NewLocal(baseDir), nil
 	case "S3", "s3":
-		return nil, fmt.Errorf("S3 snapstore provider not yet implemented")
+		return NewS3(cfg)
 	case "GCS", "gcs":
-		return nil, fmt.Errorf("GCS snapstore provider not yet implemented")
+		return NewGCS(cfg)
 	case "ABS", "abs":
-		return nil, fmt.Errorf("ABS snapstore provider not yet implemented")
+		return NewABS(cfg)
 	default:
 		return nil, fmt.Errorf("unsupported snapstore provider %q", cfg.Provider)
 	}

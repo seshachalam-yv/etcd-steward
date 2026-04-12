@@ -556,6 +556,12 @@ func main() {
 	// Register leaderwatch as a provider (always active).
 	statusReconciler.RegisterProvider("leaderwatch", watcher)
 
+	// Register a static provider for PeerTLSEnabled — value is fixed at startup and
+	// must be present on every StatusReconciler tick to survive merge-patch overwrites.
+	statusReconciler.RegisterProvider("peer-tls", member.InfoProviderFunc(func() member.StatusInfo {
+		return member.StatusInfo{PeerTLSEnabled: &peerTLSEnabled}
+	}))
+
 	if snap != nil {
 		statusReconciler.RegisterProvider("snapshotter", snap)
 	}
@@ -635,14 +641,6 @@ func main() {
 	// Auto-start initialization with the determined mode.
 	if err := init.Start(ctx, string(valMode)); err != nil {
 		logger.Error("failed to start initialization", zap.Error(err))
-	}
-
-	// Write PeerTLSEnabled to EtcdMember status once at startup.
-	// Peer TLS is active when the peer URL uses the https scheme.
-	if err := memberClient.UpdateStatus(ctx, cfg.PodName, cfg.PodNamespace, member.UpdateStatusOpts{
-		PeerTLSEnabled: &peerTLSEnabled,
-	}); err != nil {
-		logger.Warn("failed to set peerTLSEnabled on EtcdMember", zap.Error(err))
 	}
 
 	// Wait for context cancellation.

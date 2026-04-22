@@ -5,11 +5,11 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
@@ -81,13 +81,13 @@ func LoadFromFile(cfg *Config, path string, fs *pflag.FlagSet) error {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("failed to read config file %s: %w", path, err)
+		return errors.Wrap(errors.ErrCodeConfig, "failed to read config file "+path, err)
 	}
 
 	v := viper.New()
 	v.SetConfigType("yaml")
 	if err := v.ReadConfig(strings.NewReader(string(data))); err != nil {
-		return fmt.Errorf("failed to parse config file %s: %w", path, err)
+		return errors.Wrap(errors.ErrCodeConfig, "failed to parse config file "+path, err)
 	}
 
 	// Apply file values only for flags that were NOT explicitly set on the command line.

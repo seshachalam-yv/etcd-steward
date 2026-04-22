@@ -6,10 +6,10 @@ package gc
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"time"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"github.com/gardener/etcd-steward/internal/snapstore"
 	"go.uber.org/zap"
 )
@@ -26,10 +26,13 @@ type SnapshotSet struct {
 
 // GarbageCollector periodically removes old snapshot sets, keeping at most
 // maxSets sets. The latest set is never deleted.
+// When a RetentionPolicy is configured it is used instead of the simple
+// maxSets count.
 type GarbageCollector struct {
 	store   snapstore.SnapStore
 	maxSets int
 	period  time.Duration
+	policy  RetentionPolicy
 	logger  *zap.Logger
 }
 
@@ -40,6 +43,17 @@ func New(store snapstore.SnapStore, maxSets int, period time.Duration, logger *z
 		maxSets: maxSets,
 		period:  period,
 		logger:  logger,
+	}
+}
+
+// NewWithPolicy creates a GarbageCollector that uses the given RetentionPolicy
+// to decide which snapshot sets to delete.
+func NewWithPolicy(store snapstore.SnapStore, policy RetentionPolicy, period time.Duration, logger *zap.Logger) *GarbageCollector {
+	return &GarbageCollector{
+		store:  store,
+		policy: policy,
+		period: period,
+		logger: logger,
 	}
 }
 
@@ -63,31 +77,34 @@ func (g *GarbageCollector) Run(ctx context.Context) {
 
 // Collect lists all snapshots, groups them into sets, and deletes the oldest
 // sets that exceed maxSets. The latest set is never deleted (minimum 1 is
-// always retained).
+// always retained). When a RetentionPolicy is configured, it is used to
+// determine which sets to remove.
 func (g *GarbageCollector) Collect(ctx context.Context) error {
 	snaps, err := g.store.List(ctx)
 	if err != nil {
-		return fmt.Errorf("listing snapshots: %w", err)
+		return errors.Wrap(errors.ErrCodeSnapshot, "listing snapshots for garbage collection", err)
 	}
 
 	sets := GroupSnapshots(snaps)
-	if len(sets) <= g.maxSets {
+
+	deleteIndices := g.computeDeleteIndices(sets)
+	if len(deleteIndices) == 0 {
 		g.logger.Info("no sets to garbage collect",
 			zap.Int("totalSets", len(sets)),
-			zap.Int("maxSets", g.maxSets),
 		)
 		return nil
 	}
 
-	// Always keep at least 1 set (the latest).
-	toDelete := len(sets) - g.maxSets
-	if toDelete >= len(sets) {
-		toDelete = len(sets) - 1
+	deleteSet := make(map[int]bool, len(deleteIndices))
+	for _, idx := range deleteIndices {
+		deleteSet[idx] = true
 	}
 
 	var deleted int
-	for i := 0; i < toDelete; i++ {
-		set := sets[i]
+	for i, set := range sets {
+		if !deleteSet[i] {
+			continue
+		}
 		// Delete deltas first, then the full snapshot.
 		for _, delta := range set.Deltas {
 			if err := g.store.Delete(ctx, delta.Name); err != nil {
@@ -111,10 +128,42 @@ func (g *GarbageCollector) Collect(ctx context.Context) error {
 
 	g.logger.Info("garbage collection completed",
 		zap.Int("deletedSnapshots", deleted),
-		zap.Int("setsRemoved", toDelete),
-		zap.Int("setsRetained", len(sets)-toDelete),
+		zap.Int("setsRemoved", len(deleteIndices)),
+		zap.Int("setsRetained", len(sets)-len(deleteIndices)),
 	)
 	return nil
+}
+
+// computeDeleteIndices returns the indices (into a sorted oldest-first set
+// slice) of sets that should be deleted.
+func (g *GarbageCollector) computeDeleteIndices(sets []SnapshotSet) []int {
+	if g.policy != nil {
+		return g.computePolicyDeleteIndices(sets)
+	}
+	return EvaluateCountPolicy(sets, g.maxSets)
+}
+
+// computePolicyDeleteIndices uses the configured RetentionPolicy to determine
+// which sets to delete. For CalendarPolicy it delegates to the batch evaluator;
+// for other policies it evaluates each set individually.
+func (g *GarbageCollector) computePolicyDeleteIndices(sets []SnapshotSet) []int {
+	now := time.Now().UTC()
+
+	if cp, ok := g.policy.(*CalendarPolicy); ok {
+		return EvaluateCalendarPolicy(sets, *cp, now)
+	}
+
+	var toDelete []int
+	for i, set := range sets {
+		// Never delete the latest set.
+		if i == len(sets)-1 {
+			continue
+		}
+		if !g.policy.ShouldRetain(set, now) {
+			toDelete = append(toDelete, i)
+		}
+	}
+	return toDelete
 }
 
 // GroupSnapshots groups a flat list of snapshots (sorted by CreatedAt ascending)

@@ -5,7 +5,7 @@
 package snapstore
 
 import (
-	"fmt"
+	"github.com/gardener/etcd-steward/internal/errors"
 )
 
 const (
@@ -35,6 +35,6 @@ func NewSnapStore(provider, prefix, container string, config map[string]string) 
 	case ProviderABS:
 		return NewABS(container, prefix, config)
 	default:
-		return nil, fmt.Errorf("unknown snapstore provider %q", provider)
+		return nil, errors.New(errors.ErrCodeValidation, "unknown snapstore provider: "+provider)
 	}
 }

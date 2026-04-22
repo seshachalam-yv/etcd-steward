@@ -82,7 +82,7 @@ func (r *Renewer) renew(ctx context.Context) {
 			},
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       strPtr(r.podName),
-				LeaseDurationSeconds: int32Ptr(int32(r.heartbeat.Seconds()) * 3),
+				LeaseDurationSeconds: int32Ptr(leaseDurationSeconds(r.heartbeat)),
 				RenewTime:            &now,
 			},
 		}
@@ -115,4 +115,17 @@ func strPtr(s string) *string {
 
 func int32Ptr(i int32) *int32 {
 	return &i
+}
+
+// leaseDurationSeconds calculates the lease duration (3x heartbeat) safely,
+// clamping to avoid int32 overflow.
+func leaseDurationSeconds(heartbeat time.Duration) int32 {
+	secs := int64(heartbeat.Seconds()) * 3
+	if secs > int64(^int32(0)) {
+		secs = int64(^int32(0))
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	return int32(secs)
 }

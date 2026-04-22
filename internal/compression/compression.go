@@ -7,9 +7,9 @@ package compression
 import (
 	"bytes"
 	"compress/gzip"
-	"fmt"
 	"io"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -36,7 +36,7 @@ func Compress(src io.Reader, algo Algorithm) (io.Reader, error) {
 	case AlgorithmNone:
 		return src, nil
 	default:
-		return nil, fmt.Errorf("unknown compression algorithm: %q", algo)
+		return nil, errors.New(errors.ErrCodeValidation, "unknown compression algorithm: "+string(algo))
 	}
 }
 
@@ -52,7 +52,7 @@ func Decompress(src io.Reader, algo Algorithm) (io.ReadCloser, error) {
 	case AlgorithmNone:
 		return io.NopCloser(src), nil
 	default:
-		return nil, fmt.Errorf("unknown compression algorithm: %q", algo)
+		return nil, errors.New(errors.ErrCodeValidation, "unknown compression algorithm: "+string(algo))
 	}
 }
 
@@ -60,10 +60,10 @@ func compressGzip(src io.Reader) (io.Reader, error) {
 	var buf bytes.Buffer
 	w := gzip.NewWriter(&buf)
 	if _, err := io.Copy(w, src); err != nil {
-		return nil, fmt.Errorf("gzip compress: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "gzip compress", err)
 	}
 	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("gzip close: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "gzip close", err)
 	}
 	return &buf, nil
 }
@@ -72,13 +72,13 @@ func compressZstd(src io.Reader) (io.Reader, error) {
 	var buf bytes.Buffer
 	w, err := zstd.NewWriter(&buf)
 	if err != nil {
-		return nil, fmt.Errorf("zstd writer: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "zstd writer", err)
 	}
 	if _, err := io.Copy(w, src); err != nil {
-		return nil, fmt.Errorf("zstd compress: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "zstd compress", err)
 	}
 	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("zstd close: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "zstd close", err)
 	}
 	return &buf, nil
 }
@@ -86,7 +86,7 @@ func compressZstd(src io.Reader) (io.Reader, error) {
 func decompressZstd(src io.Reader) (io.ReadCloser, error) {
 	r, err := zstd.NewReader(src)
 	if err != nil {
-		return nil, fmt.Errorf("zstd reader: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeIO, "zstd reader", err)
 	}
 	return io.NopCloser(r), nil
 }

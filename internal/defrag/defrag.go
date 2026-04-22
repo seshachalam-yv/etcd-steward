@@ -6,10 +6,11 @@ package defrag
 
 import (
 	"context"
-	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"go.uber.org/zap"
 )
 
@@ -119,18 +120,18 @@ func (d *Defragmenter) Run(ctx context.Context) {
 func (d *Defragmenter) Defragment(ctx context.Context) error {
 	endpoints, err := d.cluster.MemberEndpoints(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list member endpoints: %w", err)
+		return errors.Wrap(errors.ErrCodeEtcd, "failed to list member endpoints", err)
 	}
 
 	if len(endpoints) == 0 {
-		return fmt.Errorf("no member endpoints found")
+		return errors.New(errors.ErrCodeEtcd, "no member endpoints found")
 	}
 
 	// Write initial status for all members.
 	for _, ep := range endpoints {
 		key := statusKeyPrefix + ep
 		if err := d.kv.Put(ctx, key, "pending"); err != nil {
-			return fmt.Errorf("failed to write defrag status for %s: %w", ep, err)
+			return errors.Wrap(errors.ErrCodeEtcd, "failed to write defrag status for "+ep, err)
 		}
 	}
 
@@ -168,7 +169,7 @@ func (d *Defragmenter) DefragDirect(ctx context.Context, endpoint string) error 
 	d.logger.Info("direct defrag (NOSPACE bypass)", zap.String("endpoint", endpoint))
 
 	if err := d.maintenance.Defragment(ctx, endpoint); err != nil {
-		return fmt.Errorf("direct defrag failed for %s: %w", endpoint, err)
+		return errors.Wrap(errors.ErrCodeEtcd, "direct defrag failed for "+endpoint, err)
 	}
 
 	d.logger.Info("direct defrag completed", zap.String("endpoint", endpoint))
@@ -179,7 +180,7 @@ func (d *Defragmenter) DefragDirect(ctx context.Context, endpoint string) error 
 // endpoint, and releases the lock.
 func (d *Defragmenter) defragMember(ctx context.Context, endpoint string) error {
 	if err := d.lock.Acquire(ctx); err != nil {
-		return fmt.Errorf("failed to acquire lock for defrag of %s: %w", endpoint, err)
+		return errors.Wrap(errors.ErrCodeEtcd, "failed to acquire lock for defrag of "+endpoint, err)
 	}
 	defer func() {
 		if err := d.lock.Release(ctx); err != nil {
@@ -190,7 +191,7 @@ func (d *Defragmenter) defragMember(ctx context.Context, endpoint string) error 
 	d.logger.Info("defragmenting member", zap.String("endpoint", endpoint))
 
 	if err := d.maintenance.Defragment(ctx, endpoint); err != nil {
-		return fmt.Errorf("defragment failed for %s: %w", endpoint, err)
+		return errors.Wrap(errors.ErrCodeEtcd, "defragment failed for "+endpoint, err)
 	}
 
 	d.logger.Info("defrag completed for member", zap.String("endpoint", endpoint))
@@ -218,20 +219,5 @@ func sortEndpoints(endpoints []string, localPodName string) []string {
 
 // isLocalEndpoint checks whether the endpoint string contains the local pod name.
 func isLocalEndpoint(endpoint, localPodName string) bool {
-	return len(localPodName) > 0 && contains(endpoint, localPodName)
-}
-
-// contains checks if s contains substr (simple string containment).
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-// searchString returns true if substr is found within s.
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return len(localPodName) > 0 && strings.Contains(endpoint, localPodName)
 }

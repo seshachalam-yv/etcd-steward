@@ -6,8 +6,8 @@ package member
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"github.com/gardener/etcd-steward/internal/snapstore"
 
 	"go.uber.org/zap"
@@ -40,7 +40,7 @@ func (p *SnapshotInfoProvider) ID() string {
 func (p *SnapshotInfoProvider) GetInfo(ctx context.Context) (map[string]interface{}, error) {
 	snaps, err := p.store.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list snapshots: %w", err)
+		return nil, errors.Wrap(errors.ErrCodeSnapshot, "failed to list snapshots", err)
 	}
 
 	var (

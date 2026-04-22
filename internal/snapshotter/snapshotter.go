@@ -308,5 +308,8 @@ func (s *Snapshotter) currentRevision(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if resp == nil || resp.Header == nil {
+		return 0, fmt.Errorf("etcd returned nil response or header")
+	}
 	return resp.Header.Revision, nil
 }

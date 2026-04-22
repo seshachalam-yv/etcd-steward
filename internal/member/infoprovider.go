@@ -6,7 +6,8 @@ package member
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/gardener/etcd-steward/internal/errors"
 )
 
 // MaintenanceStatusProvider implements MemberInfoProvider by querying the etcd
@@ -52,7 +53,7 @@ func NewMaintenanceStatusProvider(podName, endpoint string, status StatusClient)
 func (p *MaintenanceStatusProvider) MemberInfo(ctx context.Context) (MemberInfo, error) {
 	resp, err := p.status.Status(ctx, p.endpoint)
 	if err != nil {
-		return MemberInfo{}, fmt.Errorf("failed to get status from %s: %w", p.endpoint, err)
+		return MemberInfo{}, errors.Wrap(errors.ErrCodeEtcd, "failed to get status from "+p.endpoint, err)
 	}
 
 	role := "Follower"

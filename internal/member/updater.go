@@ -6,10 +6,10 @@ package member
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/gardener/etcd-steward/internal/errors"
 	"go.uber.org/zap"
 )
 
@@ -110,7 +110,7 @@ func (u *Updater) RegisterSupplementaryProvider(p SupplementaryInfoProvider) {
 func (u *Updater) RecordStateTransition(ctx context.Context) error {
 	info, err := u.collectInfo(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to collect member info: %w", err)
+		return errors.Wrap(errors.ErrCodeInternal, "failed to collect member info", err)
 	}
 
 	u.mu.Lock()
@@ -118,7 +118,7 @@ func (u *Updater) RecordStateTransition(ctx context.Context) error {
 	u.mu.Unlock()
 
 	if err := u.recorder.RecordMemberState(ctx, u.podName, u.namespace, info); err != nil {
-		return fmt.Errorf("failed to record member state: %w", err)
+		return errors.Wrap(errors.ErrCodeNetwork, "failed to record member state", err)
 	}
 
 	u.logger.Info("member state recorded",
@@ -171,7 +171,7 @@ func (u *Updater) collectInfo(ctx context.Context) (MemberInfo, error) {
 	u.mu.RUnlock()
 
 	if len(providers) == 0 {
-		return MemberInfo{}, fmt.Errorf("no info providers registered")
+		return MemberInfo{}, errors.New(errors.ErrCodeInternal, "no info providers registered")
 	}
 
 	var lastErr error
@@ -190,7 +190,7 @@ func (u *Updater) collectInfo(ctx context.Context) (MemberInfo, error) {
 	}
 
 	if !found {
-		return MemberInfo{}, fmt.Errorf("all info providers failed, last error: %w", lastErr)
+		return MemberInfo{}, errors.Wrap(errors.ErrCodeInternal, "all info providers failed", lastErr)
 	}
 
 	// Collect supplementary info from all registered supplementary providers.

@@ -97,6 +97,10 @@ func (h *Handler) handleNospace(ctx context.Context, alarm *clientv3.AlarmMember
 		h.logger.Error("failed to get current revision for compaction", zap.Error(err))
 		return
 	}
+	if getResp == nil || getResp.Header == nil {
+		h.logger.Error("etcd returned nil response or header for current revision")
+		return
+	}
 	rev := getResp.Header.Revision
 
 	// Step 2: Compact at revision - compactRevLag.

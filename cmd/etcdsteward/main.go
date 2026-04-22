@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -456,11 +457,53 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}()
 
 	// ----------------------------------------------------------------
-	// Step 1: Start HTTP server (/metrics, /healthz, /snapshot/*)
-	// NOTE: No /initialization/* or /config endpoints in Option-1.
-	// The steward drives the flow, not the wrapper.
+	// Step 1: Start HTTP server (/metrics, /healthz, /snapshot/*, AND
+	// backward-compatible /initialization/*, /config endpoints for old wrapper)
+	// DUAL-MODE: supports both old wrapper (polls /initialization/status)
+	// and new wrapper (receives POST /embedded-etcd).
 	// ----------------------------------------------------------------
 	srv := server.New(cfg.ServerPort, logger.Named("server"))
+
+	// Backward-compatible initialization endpoints for old wrapper (v0.6.2).
+	// The old wrapper polls GET /initialization/status, triggers GET /initialization/start,
+	// then gets GET /config to start etcd.
+	var initStatus atomic.Value
+	initStatus.Store("New")
+
+	srv.RegisterHandler("/initialization/status", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		status := initStatus.Load().(string)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, status)
+		// Reset to New after Successful/Failed read (matching backup-restore behavior)
+		if status == "Successful" || status == "Failed" {
+			initStatus.Store("New")
+		}
+	}))
+
+	srv.RegisterHandler("/initialization/start", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The actual initialization runs synchronously in the main flow below.
+		// This endpoint just signals that the wrapper has asked for init.
+		// The status transitions happen in the main flow.
+		logger.Info("initialization/start called by wrapper",
+			zap.String("mode", r.URL.Query().Get("mode")))
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cfgH := &configHandler{
+		cfg:    cfg,
+		logger: logger.Named("config"),
+	}
+	srv.RegisterHandler("/config", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := cfgH.getConfig()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-yaml")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	}))
 
 	// Snapshot endpoints (initially with nil snapshotter; will be set after
 	// etcd is ready and snapshotter is created).
@@ -481,6 +524,9 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}()
 
 	logger.Info("HTTP server started")
+
+	// Mark init as in progress for the old wrapper.
+	initStatus.Store("Progress")
 
 	// ----------------------------------------------------------------
 	// Step 2: Validate data directory
@@ -549,11 +595,12 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 
 	// ----------------------------------------------------------------
 	// Step 5: Build etcd config YAML
+	// Mark initialization as Successful for old wrapper.
 	// ----------------------------------------------------------------
-	cfgH := &configHandler{
-		cfg:    cfg,
-		logger: logger.Named("config"),
-	}
+	initStatus.Store("Successful")
+	logger.Info("initialization complete, status set to Successful")
+
+	// configHandler already created above for /config endpoint.
 	etcdConfigYAML, err := cfgH.getConfig()
 	if err != nil {
 		return fmt.Errorf("failed to build etcd config: %w", err)

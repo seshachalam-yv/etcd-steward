@@ -20,6 +20,7 @@ import (
 	"github.com/gardener/etcd-steward/cmd/etcdsteward/compact"
 	"github.com/gardener/etcd-steward/cmd/etcdsteward/copybackups"
 	"github.com/gardener/etcd-steward/internal/alarm"
+	"github.com/gardener/etcd-steward/internal/bootstrapper"
 	"github.com/gardener/etcd-steward/internal/compression"
 	"github.com/gardener/etcd-steward/internal/config"
 	"github.com/gardener/etcd-steward/internal/defrag"
@@ -55,143 +56,7 @@ const etcdReadyPollInterval = 2 * time.Second
 // etcdReadyTimeout is the maximum time to wait for etcd to become ready.
 const etcdReadyTimeout = 5 * time.Minute
 
-// initHandler manages the asynchronous, stateful initialization lifecycle
-// that the etcd-wrapper polls via /initialization/status and triggers via
-// /initialization/start.
-type initHandler struct {
-	mu        sync.Mutex
-	status    server.InitStatus
-	validator *validator.Validator
-	restorer  *restorer.Restorer // nil if no backup store configured
-	cfg       *config.Config
-	logger    *zap.Logger
-}
-
-// getStatus returns the current initialization status. If the status is
-// Successful or Failed, it resets to New on the next read (matching
-// backup-restore behavior so that re-initialization is possible on pod
-// restart).
-func (h *initHandler) getStatus() server.InitStatus {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	s := h.status
-	if s == server.InitStatusSuccessful || s == server.InitStatusFailed {
-		h.status = server.InitStatusNew
-	}
-	return s
-}
-
-// startInit triggers an asynchronous initialization. If initialization is
-// already in progress or completed, the call is a no-op and returns nil.
-func (h *initHandler) startInit(ctx context.Context, mode string) error {
-	h.mu.Lock()
-	if h.status != server.InitStatusNew {
-		h.mu.Unlock()
-		return nil
-	}
-	h.status = server.InitStatusProgress
-	h.mu.Unlock()
-
-	go func() {
-		err := h.initialize(ctx, mode)
-		h.mu.Lock()
-		if err != nil {
-			h.logger.Error("initialization failed", zap.Error(err))
-			h.status = server.InitStatusFailed
-		} else {
-			h.logger.Info("initialization completed successfully")
-			h.status = server.InitStatusSuccessful
-		}
-		h.mu.Unlock()
-	}()
-
-	return nil
-}
-
-// initialize performs the actual initialization work:
-//  1. Validate the data directory (sanity or full check based on mode).
-//  2. If the data directory is empty or corrupt and a restorer is available,
-//     attempt to restore from the latest full snapshot.
-//  3. If no restorer or no snapshots, etcd will start fresh.
-func (h *initHandler) initialize(_ context.Context, mode string) error {
-	h.logger.Info("starting initialization", zap.String("mode", mode))
-
-	// Check if data dir is empty first.
-	dataDirEmpty := isDataDirEmpty(h.cfg.DataDir)
-	if dataDirEmpty {
-		h.logger.Info("data directory is empty, skipping validation")
-	} else {
-		// Validate data directory.
-		if mode == "Full" {
-			isSingleNode := !isMultiNode(h.cfg)
-			if err := h.validator.FullCheck(isSingleNode); err != nil {
-				h.logger.Warn("full validation failed, data may be corrupt", zap.Error(err))
-			}
-		} else {
-			if err := h.validator.SanityCheck(); err != nil {
-				h.logger.Warn("sanity check failed, data may be corrupt", zap.Error(err))
-			}
-		}
-	}
-
-	// Determine if we need to restore.
-	corrupt := false
-	if !dataDirEmpty {
-		corrupt = h.validator.IsCorrupt()
-	}
-
-	if (dataDirEmpty || corrupt) && h.restorer != nil {
-		h.logger.Info("attempting restore from backup store",
-			zap.Bool("dataDirEmpty", dataDirEmpty),
-			zap.Bool("corrupt", corrupt),
-		)
-
-		// If corrupt, clean the data dir before restoring.
-		if corrupt {
-			h.logger.Info("cleaning corrupt data directory")
-			if err := os.RemoveAll(h.cfg.DataDir); err != nil {
-				return fmt.Errorf("failed to remove corrupt data dir: %w", err)
-			}
-			if err := os.MkdirAll(h.cfg.DataDir, 0755); err != nil {
-				return fmt.Errorf("failed to re-create data dir: %w", err)
-			}
-		}
-
-		ctx := context.Background()
-		fullSnap, err := h.restorer.FindLatestFullSnapshot(ctx)
-		if err != nil {
-			h.logger.Warn("no full snapshot found, etcd will start fresh", zap.Error(err))
-		} else {
-			h.logger.Info("found full snapshot, restoring",
-				zap.String("name", fullSnap.Name),
-				zap.Int64("endRevision", fullSnap.EndRevision),
-			)
-			if err := h.restorer.RestoreFull(ctx); err != nil {
-				return fmt.Errorf("full snapshot restore failed: %w", err)
-			}
-
-			// Find delta snapshots for later application (after etcd starts).
-			deltas, dErr := h.restorer.FindDeltaSnapshots(ctx, fullSnap.EndRevision)
-			if dErr != nil {
-				h.logger.Warn("failed to find delta snapshots", zap.Error(dErr))
-			} else if len(deltas) > 0 {
-				h.logger.Info("delta snapshots found for post-start application",
-					zap.Int("count", len(deltas)),
-				)
-				// Delta application requires a running etcd client. The main
-				// daemon loop will handle this after etcd is ready.
-			}
-		}
-	} else if dataDirEmpty || corrupt {
-		h.logger.Info("no backup store configured, etcd will start fresh")
-	} else {
-		h.logger.Info("data directory is valid, etcd will use existing data")
-	}
-
-	return nil
-}
-
-// configHandler serves the etcd configuration YAML from the druid-mounted
+// configHandler builds etcd configuration YAML from the druid-mounted
 // ConfigMap or generates a fallback from steward config flags.
 type configHandler struct {
 	cfg    *config.Config
@@ -202,7 +67,7 @@ func (h *configHandler) getConfig() ([]byte, error) {
 	// Try reading the mounted ConfigMap first.
 	data, err := os.ReadFile(etcdConfigPath)
 	if err == nil {
-		h.logger.Info("serving etcd config from mounted ConfigMap", zap.String("path", etcdConfigPath))
+		h.logger.Info("using etcd config from mounted ConfigMap", zap.String("path", etcdConfigPath))
 		return data, nil
 	}
 
@@ -447,6 +312,44 @@ func (a *memberStatusAdapter) Status(ctx context.Context, endpoint string) (memb
 	}, nil
 }
 
+// leaderRoleProvider adapts leaderwatch.Watcher to defrag.RoleProvider.
+type leaderRoleProvider struct {
+	watcher *leaderwatch.Watcher
+}
+
+func (p *leaderRoleProvider) IsLeader() bool {
+	return p.watcher.GetCurrentRole() == leaderwatch.Leader
+}
+
+// memberStateRecorderAdapter adapts statemachine.K8sRecorder to member.StateRecorder.
+type memberStateRecorderAdapter struct {
+	smRecorder *statemachine.K8sRecorder
+	sm         *statemachine.StateMachine
+}
+
+func (a *memberStateRecorderAdapter) RecordMemberState(ctx context.Context, memberName, namespace string, info member.MemberInfo) error {
+	// Map member role to a statemachine action and trigger it.
+	var action statemachine.Action
+	switch info.Role {
+	case "Leader":
+		action = statemachine.ActionWonElection
+	case "Follower":
+		action = statemachine.ActionStartAsFollower
+	default:
+		// For other roles, just record without state machine transition.
+		return nil
+	}
+
+	t, err := a.sm.Trigger(action)
+	if err != nil {
+		// Transition not valid from current state — this is expected for
+		// repeated follower/leader states. Log and continue.
+		return nil
+	}
+
+	return a.smRecorder.Record(ctx, memberName, namespace, t)
+}
+
 func newRootCommand() *cobra.Command {
 	cfg := config.DefaultConfig()
 
@@ -469,9 +372,26 @@ func newRootCommand() *cobra.Command {
 	return root
 }
 
+// runDaemon implements the Notes Option-1 architecture:
+// STEWARD ORCHESTRATES, WRAPPER EXECUTES.
+//
+// The steward drives the entire flow — it does NOT expose /initialization/*
+// endpoints for the wrapper to poll. Instead:
+//
+//  1. Start HTTP server (/metrics, /healthz, /snapshot/*)
+//  2. Validate data directory
+//  3. If corrupt: removeMember (multi-node) -> deleteDataDir
+//  4. If empty and backup store configured: download full snapshot -> restore via etcdutl
+//  5. Build etcd config YAML (from mounted ConfigMap or generate from flags)
+//  6. POST /embedded-etcd to wrapper with the config
+//  7. Wait for etcd to become reachable (poll etcd Get every 2s)
+//  8. If restoration happened: apply delta snapshots via KV client
+//  9. POST /readyz/set "ready" to wrapper -> K8s readiness probe now passes
+//  10. Start runtime components (snapshotter, GC, defrag, alarm, lease, member updater)
+//  11. Block until SIGTERM
 func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	// ----------------------------------------------------------------
-	// Phase 1: Parse config and create logger
+	// Parse config and create logger
 	// ----------------------------------------------------------------
 	if cfg.ConfigFile != "" {
 		if err := config.LoadFromFile(cfg, cfg.ConfigFile, cmd.Flags()); err != nil {
@@ -486,15 +406,16 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	logger, _ := zap.NewProduction()
 	defer func() { _ = logger.Sync() }()
 
-	logger.Info("etcd-steward daemon starting",
+	logger.Info("etcd-steward daemon starting (option-1: steward orchestrates)",
 		zap.String("version", Version),
 		zap.String("pod", cfg.PodName),
 		zap.String("namespace", cfg.PodNamespace),
 		zap.Strings("endpoints", cfg.EtcdEndpoints),
+		zap.String("wrapperURL", cfg.WrapperURL),
 	)
 
 	// ----------------------------------------------------------------
-	// Phase 2: Create snapstore (L1: nil interface gotcha)
+	// Create snapstore (L1: nil interface gotcha)
 	// ----------------------------------------------------------------
 	var store snapstore.SnapStore
 	localStore, snapErr := snapstore.NewSnapStore(cfg.StoreProvider, cfg.StorePrefix, cfg.StoreContainer, nil)
@@ -505,7 +426,7 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}
 
 	// ----------------------------------------------------------------
-	// Phase 3: Create validator and restorer
+	// Create validator and restorer
 	// ----------------------------------------------------------------
 	val := validator.New(cfg.DataDir, logger.Named("validator"))
 
@@ -521,7 +442,7 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}
 
 	// ----------------------------------------------------------------
-	// Phase 4: Set up signal handling
+	// Set up signal handling
 	// ----------------------------------------------------------------
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
@@ -535,30 +456,11 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}()
 
 	// ----------------------------------------------------------------
-	// Phase 5: Create and start HTTP server FIRST (wrapper polls immediately)
+	// Step 1: Start HTTP server (/metrics, /healthz, /snapshot/*)
+	// NOTE: No /initialization/* or /config endpoints in Option-1.
+	// The steward drives the flow, not the wrapper.
 	// ----------------------------------------------------------------
 	srv := server.New(cfg.ServerPort, logger.Named("server"))
-
-	// Initialization handler (async, stateful).
-	initH := &initHandler{
-		status:    server.InitStatusNew,
-		validator: val,
-		restorer:  restorerInst,
-		cfg:       cfg,
-		logger:    logger.Named("init"),
-	}
-
-	// Config handler.
-	cfgH := &configHandler{
-		cfg:    cfg,
-		logger: logger.Named("config"),
-	}
-
-	srv.RegisterInitializationEndpoints(
-		initH.getStatus,
-		initH.startInit,
-		cfgH.getConfig,
-	)
 
 	// Snapshot endpoints (initially with nil snapshotter; will be set after
 	// etcd is ready and snapshotter is created).
@@ -578,19 +480,103 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 		}
 	}()
 
-	logger.Info("HTTP server started, waiting for wrapper to trigger initialization")
+	logger.Info("HTTP server started")
 
 	// ----------------------------------------------------------------
-	// Phase 6: Wait for initialization to complete
+	// Step 2: Validate data directory
 	// ----------------------------------------------------------------
-	if err := waitForInitialization(ctx, initH, logger); err != nil {
-		return fmt.Errorf("waiting for initialization: %w", err)
+	needsRestore := false
+	dataDirEmpty := isDataDirEmpty(cfg.DataDir)
+
+	if dataDirEmpty {
+		logger.Info("data directory is empty, skipping validation")
+	} else {
+		// Perform a full validation check.
+		isSingleNode := !isMultiNode(cfg)
+		if err := val.FullCheck(isSingleNode); err != nil {
+			logger.Warn("full validation failed, data may be corrupt", zap.Error(err))
+		}
 	}
 
 	// ----------------------------------------------------------------
-	// Phase 7: Wait for etcd to become ready
+	// Step 3: If data corrupt -> removeMember (multi-node) -> deleteDataDir
 	// ----------------------------------------------------------------
-	logger.Info("initialization complete, waiting for etcd to become ready",
+	corrupt := false
+	if !dataDirEmpty {
+		corrupt = val.IsCorrupt()
+	}
+
+	if corrupt {
+		logger.Warn("data directory is corrupt, cleaning up")
+		// TODO: For multi-node: remove self from cluster via etcd client
+		// before deleting data directory. This requires a cluster client
+		// which is not available yet (etcd is not running).
+		if err := os.RemoveAll(cfg.DataDir); err != nil {
+			return fmt.Errorf("failed to remove corrupt data directory: %w", err)
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+			return fmt.Errorf("failed to re-create data directory: %w", err)
+		}
+		logger.Info("deleted corrupt data directory")
+		dataDirEmpty = true
+	}
+
+	// ----------------------------------------------------------------
+	// Step 4: If empty and backup store configured -> restore from backup
+	// ----------------------------------------------------------------
+	if dataDirEmpty && restorerInst != nil {
+		logger.Info("data directory is empty, attempting restore from backup store")
+		fullSnap, err := restorerInst.FindLatestFullSnapshot(ctx)
+		if err != nil {
+			logger.Warn("no full snapshot found, etcd will start fresh", zap.Error(err))
+		} else {
+			logger.Info("found full snapshot, restoring",
+				zap.String("name", fullSnap.Name),
+				zap.Int64("endRevision", fullSnap.EndRevision),
+			)
+			if err := restorerInst.RestoreFull(ctx); err != nil {
+				logger.Error("restore failed, etcd will start fresh", zap.Error(err))
+			} else {
+				needsRestore = true // deltas need to be applied after etcd starts
+				logger.Info("full snapshot restored successfully")
+			}
+		}
+	} else if dataDirEmpty {
+		logger.Info("no backup store configured, etcd will start fresh")
+	} else {
+		logger.Info("data directory is valid, etcd will use existing data")
+	}
+
+	// ----------------------------------------------------------------
+	// Step 5: Build etcd config YAML
+	// ----------------------------------------------------------------
+	cfgH := &configHandler{
+		cfg:    cfg,
+		logger: logger.Named("config"),
+	}
+	etcdConfigYAML, err := cfgH.getConfig()
+	if err != nil {
+		return fmt.Errorf("failed to build etcd config: %w", err)
+	}
+	logger.Info("etcd config built", zap.Int("configBytes", len(etcdConfigYAML)))
+
+	// ----------------------------------------------------------------
+	// Step 6: POST /embedded-etcd to wrapper with the config
+	// ----------------------------------------------------------------
+	wrapperClient := bootstrapper.NewHTTPWrapperClient(cfg.WrapperURL)
+
+	logger.Info("sending etcd config to wrapper", zap.String("wrapperURL", cfg.WrapperURL))
+	if err := wrapperClient.StartEmbeddedEtcd(ctx, etcdConfigYAML); err != nil {
+		logger.Error("failed to start embedded etcd via wrapper", zap.Error(err))
+		// This is not necessarily fatal: the wrapper may use the old init
+		// flow or may already have started etcd. Continue and let the
+		// readiness poll determine whether etcd comes up.
+	}
+
+	// ----------------------------------------------------------------
+	// Step 7: Wait for etcd to become reachable (poll Get every 2s)
+	// ----------------------------------------------------------------
+	logger.Info("waiting for etcd to become reachable",
 		zap.Strings("endpoints", cfg.EtcdEndpoints),
 	)
 
@@ -598,10 +584,10 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 		return fmt.Errorf("waiting for etcd to become ready: %w", err)
 	}
 
-	logger.Info("etcd is ready, creating client and starting components")
+	logger.Info("etcd is reachable, creating client")
 
 	// ----------------------------------------------------------------
-	// Phase 8: Create etcd client
+	// Create etcd client for runtime use
 	// ----------------------------------------------------------------
 	tlsConfig, tlsErr := buildTLSConfig(cfg)
 	if tlsErr != nil {
@@ -625,7 +611,44 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	etcdClient := etcdclient.NewClient(rawClient)
 
 	// ----------------------------------------------------------------
-	// Phase 9: Create K8s clients (best-effort, not fatal if out-of-cluster)
+	// Step 8: If restoration happened, apply delta snapshots via KV client
+	// ----------------------------------------------------------------
+	if needsRestore && restorerInst != nil {
+		logger.Info("applying delta snapshots after restore")
+		fullSnap, findErr := restorerInst.FindLatestFullSnapshot(ctx)
+		if findErr != nil {
+			logger.Warn("could not re-find full snapshot for delta application", zap.Error(findErr))
+		} else {
+			deltas, dErr := restorerInst.FindDeltaSnapshots(ctx, fullSnap.EndRevision)
+			if dErr != nil {
+				logger.Warn("failed to find delta snapshots", zap.Error(dErr))
+			} else if len(deltas) > 0 {
+				logger.Info("applying delta snapshots",
+					zap.Int("count", len(deltas)),
+					zap.Int64("afterRevision", fullSnap.EndRevision),
+				)
+				if err := restorerInst.ApplyDeltas(ctx, etcdClient, fullSnap.EndRevision, deltas); err != nil {
+					logger.Error("failed to apply delta snapshots", zap.Error(err))
+				} else {
+					logger.Info("delta snapshots applied successfully", zap.Int("count", len(deltas)))
+				}
+			} else {
+				logger.Info("no delta snapshots to apply")
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// Step 9: POST /readyz/set "ready" to wrapper -> K8s readiness probe passes
+	// ----------------------------------------------------------------
+	if err := wrapperClient.SetReady(ctx); err != nil {
+		logger.Warn("failed to set wrapper ready (wrapper may not support /readyz/set)", zap.Error(err))
+	} else {
+		logger.Info("wrapper readiness set, pod is now ready")
+	}
+
+	// ----------------------------------------------------------------
+	// Create K8s clients (best-effort, not fatal if out-of-cluster)
 	// ----------------------------------------------------------------
 	var k8sClient kubernetes.Interface
 	var dynClient dynamic.Interface
@@ -645,7 +668,7 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}
 
 	// ----------------------------------------------------------------
-	// Phase 10: Start all gated components
+	// Step 10: Start all runtime components
 	// ----------------------------------------------------------------
 	var wg sync.WaitGroup
 
@@ -871,7 +894,7 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	logger.Info("all components started, daemon is running")
 
 	// ----------------------------------------------------------------
-	// Phase 11: Block until context is cancelled (signal handler)
+	// Step 11: Block until context is cancelled (signal handler)
 	// ----------------------------------------------------------------
 	<-ctx.Done()
 	logger.Info("context cancelled, waiting for components to stop")
@@ -891,36 +914,6 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}
 
 	return nil
-}
-
-// waitForInitialization polls the init handler until initialization reaches
-// Successful status, or the context is cancelled.
-func waitForInitialization(ctx context.Context, h *initHandler, logger *zap.Logger) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			h.mu.Lock()
-			status := h.status
-			h.mu.Unlock()
-
-			switch status {
-			case server.InitStatusSuccessful:
-				logger.Info("initialization reached Successful state")
-				return nil
-			case server.InitStatusFailed:
-				return fmt.Errorf("initialization failed")
-			case server.InitStatusNew, server.InitStatusProgress:
-				// Still waiting. Note: we do NOT call getStatus() here to avoid
-				// the reset-on-read behavior. We peek at the raw status.
-				continue
-			}
-		}
-	}
 }
 
 // waitForEtcdReady polls etcd until a simple Get succeeds or timeout.
@@ -1011,44 +1004,6 @@ func isDataDirEmpty(dataDir string) bool {
 // isMultiNode returns true if the config suggests a multi-node cluster.
 func isMultiNode(cfg *config.Config) bool {
 	return len(cfg.EtcdEndpoints) > 1
-}
-
-// leaderRoleProvider adapts leaderwatch.Watcher to defrag.RoleProvider.
-type leaderRoleProvider struct {
-	watcher *leaderwatch.Watcher
-}
-
-func (p *leaderRoleProvider) IsLeader() bool {
-	return p.watcher.GetCurrentRole() == leaderwatch.Leader
-}
-
-// memberStateRecorderAdapter adapts statemachine.K8sRecorder to member.StateRecorder.
-type memberStateRecorderAdapter struct {
-	smRecorder *statemachine.K8sRecorder
-	sm         *statemachine.StateMachine
-}
-
-func (a *memberStateRecorderAdapter) RecordMemberState(ctx context.Context, memberName, namespace string, info member.MemberInfo) error {
-	// Map member role to a statemachine action and trigger it.
-	var action statemachine.Action
-	switch info.Role {
-	case "Leader":
-		action = statemachine.ActionWonElection
-	case "Follower":
-		action = statemachine.ActionStartAsFollower
-	default:
-		// For other roles, just record without state machine transition.
-		return nil
-	}
-
-	t, err := a.sm.Trigger(action)
-	if err != nil {
-		// Transition not valid from current state — this is expected for
-		// repeated follower/leader states. Log and continue.
-		return nil
-	}
-
-	return a.smRecorder.Record(ctx, memberName, namespace, t)
 }
 
 func newVersionCommand() *cobra.Command {

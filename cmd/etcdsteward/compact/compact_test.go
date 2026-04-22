@@ -18,7 +18,7 @@ func TestCompact_Name(t *testing.T) {
 func TestCompact_HasFlags(t *testing.T) {
 	cmd := NewCommand()
 
-	expectedFlags := []string{"config", "data-dir", "etcd-endpoints", "store-prefix", "store-container"}
+	expectedFlags := []string{"data-dir", "store-provider", "store-prefix", "store-container", "compression-algo"}
 	for _, name := range expectedFlags {
 		f := cmd.Flags().Lookup(name)
 		if f == nil {
@@ -35,5 +35,28 @@ func TestCompact_DataDirDefault(t *testing.T) {
 	}
 	if f.DefValue != "/var/etcd/data/new.etcd" {
 		t.Errorf("expected data-dir default %q, got %q", "/var/etcd/data/new.etcd", f.DefValue)
+	}
+}
+
+func TestCompactCommand_AllFlags(t *testing.T) {
+	cmd := NewCommand()
+
+	flags := map[string]string{
+		"data-dir":         "/var/etcd/data/new.etcd",
+		"store-provider":   "Local",
+		"store-prefix":     "",
+		"store-container":  "",
+		"compression-algo": "none",
+	}
+
+	for name, expectedDefault := range flags {
+		f := cmd.Flags().Lookup(name)
+		if f == nil {
+			t.Errorf("flag %q not registered", name)
+			continue
+		}
+		if f.DefValue != expectedDefault {
+			t.Errorf("flag %q: expected default %q, got %q", name, expectedDefault, f.DefValue)
+		}
 	}
 }

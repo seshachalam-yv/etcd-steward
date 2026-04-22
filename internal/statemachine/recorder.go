@@ -58,12 +58,16 @@ func (r *K8sRecorder) Record(ctx context.Context, memberName, namespace string, 
 		transition["message"] = t.Message
 	}
 
+	statusPatch := map[string]interface{}{
+		"state":          string(t.State),
+		"lastTransition": transition,
+	}
+	if t.SubState != SubStateNone {
+		statusPatch["subState"] = string(t.SubState)
+	}
+
 	patch := map[string]interface{}{
-		"status": map[string]interface{}{
-			"state":          string(t.State),
-			"subState":       string(t.SubState),
-			"lastTransition": transition,
-		},
+		"status": statusPatch,
 	}
 
 	patchBytes, err := json.Marshal(patch)

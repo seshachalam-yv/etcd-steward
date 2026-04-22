@@ -19,6 +19,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// maxDeltaSnapshotBytes is the upper bound on accumulated event data before a
+// delta snapshot is flushed to the snap store.
+const maxDeltaSnapshotBytes = 100 * 1024 * 1024
+
+// Watcher abstracts the etcd Watch API so it can be mocked in tests.
+type Watcher interface {
+	Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan
+}
+
 // DistributedLock provides mutual exclusion across replicas so that only one
 // etcd-steward instance takes snapshots at a time.
 type DistributedLock interface {
@@ -33,6 +42,7 @@ type DistributedLock interface {
 type Snapshotter struct {
 	etcdClient   etcdclient.KV
 	maintenance  etcdclient.Maintenance
+	watcher      Watcher
 	store        snapstore.SnapStore
 	lock         DistributedLock
 	compressAlgo compression.Algorithm
@@ -49,6 +59,7 @@ type Snapshotter struct {
 func New(
 	etcdClient etcdclient.KV,
 	maintenance etcdclient.Maintenance,
+	watcher Watcher,
 	store snapstore.SnapStore,
 	lock DistributedLock,
 	compressAlgo compression.Algorithm,
@@ -59,6 +70,7 @@ func New(
 	return &Snapshotter{
 		etcdClient:    etcdClient,
 		maintenance:   maintenance,
+		watcher:       watcher,
 		store:         store,
 		lock:          lock,
 		compressAlgo:  compressAlgo,
@@ -167,8 +179,9 @@ func (s *Snapshotter) TakeFullSnapshot(ctx context.Context) error {
 	return nil
 }
 
-// TakeDeltaSnapshot records the current etcd revision as a delta snapshot.
-// If the revision has not advanced since the last snapshot, the delta is
+// TakeDeltaSnapshot watches the etcd event stream from the last known revision,
+// collects mutation events, serialises them as compressed NDJSON, and uploads
+// the result to the snap store. If no new revisions exist the snapshot is
 // skipped.
 func (s *Snapshotter) TakeDeltaSnapshot(ctx context.Context) error {
 	rev, err := s.currentRevision(ctx)
@@ -193,10 +206,70 @@ func (s *Snapshotter) TakeDeltaSnapshot(ctx context.Context) error {
 		zap.Int64("endRevision", rev),
 	)
 
-	// Delta snapshots are lightweight markers; store a minimal payload with
-	// revision range metadata.
-	payload := []byte(fmt.Sprintf("delta:%d-%d", lastRev+1, rev))
-	compressed, err := compression.Compress(bytes.NewReader(payload), s.compressAlgo)
+	// Watch events from lastDeltaRev+1 up to the current revision.
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+
+	watchCh := s.watcher.Watch(watchCtx, "", clientv3.WithPrefix(), clientv3.WithRev(lastRev+1))
+
+	var events []Event
+	var accumulatedSize int
+	endRev := lastRev
+
+	collectLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case wresp, ok := <-watchCh:
+			if !ok {
+				break collectLoop
+			}
+			if err := wresp.Err(); err != nil {
+				return fmt.Errorf("watch error: %w", err)
+			}
+			for _, ev := range wresp.Events {
+				event := Event{
+					Key:      ev.Kv.Key,
+					Revision: ev.Kv.ModRevision,
+				}
+				if ev.Type == clientv3.EventTypePut {
+					event.Type = EventTypePut
+					event.Value = ev.Kv.Value
+				} else {
+					event.Type = EventTypeDelete
+				}
+				events = append(events, event)
+				accumulatedSize += len(event.Key) + len(event.Value)
+
+				if event.Revision > endRev {
+					endRev = event.Revision
+				}
+
+				if accumulatedSize >= maxDeltaSnapshotBytes {
+					break collectLoop
+				}
+			}
+			// If we have caught up to the target revision, stop collecting.
+			if endRev >= rev {
+				break collectLoop
+			}
+		}
+	}
+	watchCancel()
+
+	if len(events) == 0 {
+		s.logger.Info("watch returned no events, skipping delta")
+		return nil
+	}
+
+	// Serialise events as NDJSON.
+	var buf bytes.Buffer
+	if err := WriteEvents(&buf, events); err != nil {
+		return fmt.Errorf("serialising delta events: %w", err)
+	}
+
+	compressed, err := compression.Compress(&buf, s.compressAlgo)
 	if err != nil {
 		return fmt.Errorf("compressing delta snapshot: %w", err)
 	}
@@ -205,7 +278,7 @@ func (s *Snapshotter) TakeDeltaSnapshot(ctx context.Context) error {
 	info := snapstore.SnapInfo{
 		Kind:          snapstore.SnapKindDelta,
 		StartRevision: lastRev + 1,
-		EndRevision:   rev,
+		EndRevision:   endRev,
 		CreatedAt:     now,
 		IsCompressed:  s.compressAlgo != compression.AlgorithmNone,
 	}
@@ -216,14 +289,15 @@ func (s *Snapshotter) TakeDeltaSnapshot(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	s.lastDeltaRev = rev
+	s.lastDeltaRev = endRev
 	s.mu.Unlock()
 
 	s.logger.Info("delta snapshot uploaded",
 		zap.String("name", result.Name),
 		zap.Int64("startRevision", lastRev+1),
-		zap.Int64("endRevision", rev),
+		zap.Int64("endRevision", endRev),
 		zap.Int64("size", result.Size),
+		zap.Int("eventCount", len(events)),
 	)
 	return nil
 }

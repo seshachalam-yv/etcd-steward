@@ -13,6 +13,8 @@ import (
 	"sort"
 
 	"github.com/gardener/etcd-steward/internal/compression"
+	"github.com/gardener/etcd-steward/internal/etcdclient"
+	"github.com/gardener/etcd-steward/internal/snapshotter"
 	"github.com/gardener/etcd-steward/internal/snapstore"
 	"go.etcd.io/etcd/etcdutl/v3/snapshot"
 	"go.uber.org/zap"
@@ -167,9 +169,74 @@ func (r *Restorer) FindDeltaSnapshots(ctx context.Context, afterRevision int64) 
 	return deltas, nil
 }
 
-// ApplyDeltas is a stub that will replay delta snapshots on top of a restored
-// full snapshot. This is not yet implemented.
-func (r *Restorer) ApplyDeltas(_ context.Context, _ []snapstore.SnapInfo) error {
-	r.logger.Warn("ApplyDeltas is not yet implemented")
+// ApplyDeltas downloads each delta snapshot in order, deserialises its events,
+// and replays them against the provided etcd KV client. Events whose revision
+// is less than or equal to currentRevision are skipped to avoid re-applying
+// mutations that already exist in the restored data directory.
+func (r *Restorer) ApplyDeltas(ctx context.Context, kvClient etcdclient.KV, currentRevision int64, deltas []snapstore.SnapInfo) error {
+	for i, delta := range deltas {
+		r.logger.Info("applying delta snapshot",
+			zap.Int("index", i),
+			zap.String("name", delta.Name),
+			zap.Int64("startRevision", delta.StartRevision),
+			zap.Int64("endRevision", delta.EndRevision),
+		)
+
+		events, err := r.downloadAndReadEvents(ctx, delta)
+		if err != nil {
+			return fmt.Errorf("reading events from delta %q: %w", delta.Name, err)
+		}
+
+		applied := 0
+		for _, ev := range events {
+			if ev.Revision <= currentRevision {
+				continue
+			}
+
+			switch ev.Type {
+			case snapshotter.EventTypePut:
+				if _, err := kvClient.Put(ctx, string(ev.Key), string(ev.Value)); err != nil {
+					return fmt.Errorf("putting key %q at revision %d: %w", string(ev.Key), ev.Revision, err)
+				}
+			case snapshotter.EventTypeDelete:
+				if _, err := kvClient.Delete(ctx, string(ev.Key)); err != nil {
+					return fmt.Errorf("deleting key %q at revision %d: %w", string(ev.Key), ev.Revision, err)
+				}
+			default:
+				return fmt.Errorf("unknown event type %q at revision %d", ev.Type, ev.Revision)
+			}
+			applied++
+		}
+
+		r.logger.Info("delta snapshot applied",
+			zap.String("name", delta.Name),
+			zap.Int("totalEvents", len(events)),
+			zap.Int("appliedEvents", applied),
+			zap.Int64("startRevision", delta.StartRevision),
+			zap.Int64("endRevision", delta.EndRevision),
+		)
+	}
 	return nil
+}
+
+// downloadAndReadEvents downloads the snapshot data, decompresses it if needed,
+// and deserialises the NDJSON events.
+func (r *Restorer) downloadAndReadEvents(ctx context.Context, snap snapstore.SnapInfo) ([]snapshotter.Event, error) {
+	rc, err := r.store.Download(ctx, snap.Name)
+	if err != nil {
+		return nil, fmt.Errorf("downloading snapshot %q: %w", snap.Name, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	var reader io.Reader = rc
+	if snap.IsCompressed {
+		dc, err := compression.Decompress(rc, r.compressAlgo)
+		if err != nil {
+			return nil, fmt.Errorf("decompressing snapshot %q: %w", snap.Name, err)
+		}
+		defer func() { _ = dc.Close() }()
+		reader = dc
+	}
+
+	return snapshotter.ReadEvents(reader)
 }

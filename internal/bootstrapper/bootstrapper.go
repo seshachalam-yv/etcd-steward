@@ -22,6 +22,8 @@ type Bootstrapper struct {
 	dataDir      string
 	isSingleNode bool
 	isLearner    bool
+	memberID     uint64
+	peerURLs     []string
 	restorer     RestoreProvider
 	stateMachine StateMachineProvider
 	recorder     Recorder
@@ -37,6 +39,8 @@ func New(
 	dataDir string,
 	isSingleNode bool,
 	isLearner bool,
+	memberID uint64,
+	peerURLs []string,
 	restorer RestoreProvider,
 	stateMachine StateMachineProvider,
 	recorder Recorder,
@@ -50,6 +54,8 @@ func New(
 		dataDir:      dataDir,
 		isSingleNode: isSingleNode,
 		isLearner:    isLearner,
+		memberID:     memberID,
+		peerURLs:     peerURLs,
 		restorer:     restorer,
 		stateMachine: stateMachine,
 		recorder:     recorder,
@@ -61,9 +67,12 @@ func New(
 
 // Initialize performs the bootstrap sequence:
 //  1. Validate data directory state.
-//  2. If corrupt: remove member from cluster, delete data directory.
-//  3. If clean and non-empty: start with last known state.
-//  4. If empty: attempt restore from snapshot (if restorer != nil), or start
+//  2. If corrupt: for multi-node clusters remove self from cluster by ID, then
+//     delete data directory.
+//  3. If learner joining existing cluster: add as learner, start etcd, then
+//     record PendingLearner -> Learner transition.
+//  4. If clean and non-empty: start with last known state.
+//  5. If empty: attempt restore from snapshot (if restorer != nil), or start
 //     as a brand new member.
 func (b *Bootstrapper) Initialize(ctx context.Context) error {
 	b.logger.Info("starting bootstrap",
@@ -81,9 +90,20 @@ func (b *Bootstrapper) Initialize(ctx context.Context) error {
 	if b.IsDataDirCorrupt() {
 		b.logger.Warn("data directory is corrupt, performing recovery")
 
-		if err := b.cluster.RemoveMember(ctx, b.podName); err != nil {
-			b.logger.Error("failed to remove member from cluster", zap.Error(err))
-			// Continue with data dir cleanup regardless.
+		// For multi-node clusters, remove self from cluster membership before
+		// cleaning up the data directory so that the remaining members stop
+		// trying to replicate to this node.
+		if !b.isSingleNode && b.memberID != 0 {
+			if err := b.cluster.MemberRemoveByID(ctx, b.memberID); err != nil {
+				b.logger.Error("failed to remove member by ID from cluster",
+					zap.Uint64("memberID", b.memberID), zap.Error(err))
+				// Continue with data dir cleanup regardless.
+			}
+		} else {
+			if err := b.cluster.RemoveMember(ctx, b.podName); err != nil {
+				b.logger.Error("failed to remove member from cluster", zap.Error(err))
+				// Continue with data dir cleanup regardless.
+			}
 		}
 
 		if err := b.deleteDataDir(); err != nil {
@@ -94,7 +114,13 @@ func (b *Bootstrapper) Initialize(ctx context.Context) error {
 		// Fall through to empty data dir path.
 	}
 
-	// Step 2: Non-empty, non-corrupt data directory — start with existing state.
+	// Step 2: Learner join flow — isLearner is true, data dir is empty,
+	// and we have peer URLs to announce.
+	if b.isLearner && b.IsDataDirEmpty() && len(b.peerURLs) > 0 {
+		return b.joinAsLearner(ctx)
+	}
+
+	// Step 3: Non-empty, non-corrupt data directory — start with existing state.
 	if !b.IsDataDirEmpty() {
 		b.logger.Info("data directory exists and is not empty, starting with last known state")
 		if err := b.recorder.RecordBootstrapState(ctx, b.podName, b.namespace, "StartingExisting"); err != nil {
@@ -106,7 +132,7 @@ func (b *Bootstrapper) Initialize(ctx context.Context) error {
 		return b.startEtcd(ctx)
 	}
 
-	// Step 3: Empty data directory — try restore or start new.
+	// Step 4: Empty data directory — try restore or start new.
 	b.logger.Info("data directory is empty")
 
 	// CRITICAL L1: Only attempt restore if restorer is provided.
@@ -142,6 +168,68 @@ func (b *Bootstrapper) Initialize(ctx context.Context) error {
 		b.logger.Error("failed to trigger state transition for new member", zap.Error(err))
 	}
 	return b.startEtcd(ctx)
+}
+
+// joinAsLearner adds this member to the cluster as a non-voting learner,
+// starts etcd (which uses initial-cluster-state=existing), and records the
+// state transitions: Unknown -> PendingLearner -> Learner.
+func (b *Bootstrapper) joinAsLearner(ctx context.Context) error {
+	b.logger.Info("joining cluster as learner", zap.Strings("peerURLs", b.peerURLs))
+
+	if err := b.recorder.RecordBootstrapState(ctx, b.podName, b.namespace, "JoiningAsLearner"); err != nil {
+		b.logger.Error("failed to record bootstrap state", zap.Error(err))
+	}
+
+	// Add self to the existing cluster as a learner.
+	memberID, err := b.cluster.MemberAddAsLearner(ctx, b.peerURLs)
+	if err != nil {
+		return fmt.Errorf("failed to add self as learner to cluster: %w", err)
+	}
+	b.memberID = memberID
+	b.logger.Info("added as learner to cluster", zap.Uint64("memberID", memberID))
+
+	// Record synchronous transition: Unknown -> PendingLearner.
+	if err := b.stateMachine.TriggerStartAsPendingLearner(); err != nil {
+		b.logger.Error("failed to trigger PendingLearner transition", zap.Error(err))
+	}
+
+	// Start etcd — the wrapper configures initial-cluster-state=existing.
+	if err := b.startEtcd(ctx); err != nil {
+		return err
+	}
+
+	// etcd is up and syncing — transition: PendingLearner -> Learner.
+	if err := b.stateMachine.TriggerLearnerJoined(); err != nil {
+		b.logger.Error("failed to trigger Learner transition", zap.Error(err))
+	}
+
+	if err := b.recorder.RecordBootstrapState(ctx, b.podName, b.namespace, "Learner"); err != nil {
+		b.logger.Error("failed to record learner state", zap.Error(err))
+	}
+
+	b.logger.Info("learner join completed", zap.Uint64("memberID", memberID))
+	return nil
+}
+
+// PromoteLearner promotes the learner member with the given ID to a full
+// voting member and records the Learner -> Follower transition.
+func (b *Bootstrapper) PromoteLearner(ctx context.Context, memberID uint64) error {
+	b.logger.Info("promoting learner to voter", zap.Uint64("memberID", memberID))
+
+	if err := b.cluster.MemberPromote(ctx, memberID); err != nil {
+		return fmt.Errorf("failed to promote learner member %d: %w", memberID, err)
+	}
+
+	if err := b.stateMachine.TriggerPromoted(); err != nil {
+		b.logger.Error("failed to trigger Promoted transition", zap.Error(err))
+	}
+
+	if err := b.recorder.RecordBootstrapState(ctx, b.podName, b.namespace, "Follower"); err != nil {
+		b.logger.Error("failed to record follower state", zap.Error(err))
+	}
+
+	b.logger.Info("learner promoted to voter", zap.Uint64("memberID", memberID))
+	return nil
 }
 
 // IsDataDirEmpty returns true if the data directory does not exist or contains

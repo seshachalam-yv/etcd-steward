@@ -42,6 +42,8 @@ type KVClient interface {
 	Put(ctx context.Context, key, val string) error
 	// Get retrieves the value for the given key. Returns "" if not found.
 	Get(ctx context.Context, key string) (string, error)
+	// Delete removes the given key.
+	Delete(ctx context.Context, key string) error
 }
 
 // ClusterClient defines the operations needed to discover cluster members.
@@ -147,7 +149,16 @@ func (d *Defragmenter) Defragment(ctx context.Context) error {
 		}
 	}
 
-	d.logger.Info("defrag cycle completed", zap.Int("members", len(sorted)))
+	d.logger.Info("defrag cycle completed, cleaning up status keys", zap.Int("members", len(sorted)))
+
+	// Clean up status keys after all members have been processed.
+	for _, ep := range endpoints {
+		key := statusKeyPrefix + ep
+		if err := d.kv.Delete(ctx, key); err != nil {
+			d.logger.Error("failed to delete defrag status key", zap.String("key", key), zap.Error(err))
+		}
+	}
+
 	return nil
 }
 

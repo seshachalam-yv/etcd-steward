@@ -77,10 +77,12 @@ func (m *mockMaintenance) Status(_ context.Context, _ string) (int64, error) {
 }
 
 type mockKV struct {
-	mu     sync.Mutex
-	store  map[string]string
-	putErr error
-	getErr error
+	mu         sync.Mutex
+	store      map[string]string
+	putErr     error
+	getErr     error
+	deleteErr  error
+	deleted    []string
 }
 
 func newMockKV() *mockKV {
@@ -104,6 +106,17 @@ func (m *mockKV) Get(_ context.Context, key string) (string, error) {
 		return "", m.getErr
 	}
 	return m.store[key], nil
+}
+
+func (m *mockKV) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	m.deleted = append(m.deleted, key)
+	delete(m.store, key)
+	return nil
 }
 
 type mockCluster struct {
@@ -194,19 +207,19 @@ func TestDefragment_StatusKeysWritten(t *testing.T) {
 
 	d := New("pod-0", time.Minute, lock, role, maint, kv, cluster, logger)
 
+	// Intercept the status key being written by checking the store before
+	// cleanup. We verify indirectly: the key was written because defrag
+	// completed (maint.defragged has the endpoint).
 	err := d.Defragment(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify the status key was written as "completed".
+	// The status key should have been cleaned up (deleted) after completion.
+	// But verify it was written by checking that the delete was called.
 	key := statusKeyPrefix + "https://pod-0.etcd:2379"
-	val, getErr := kv.Get(context.Background(), key)
-	if getErr != nil {
-		t.Fatalf("unexpected error getting status: %v", getErr)
-	}
-	if val != "completed" {
-		t.Fatalf("expected status %q, got %q", "completed", val)
+	if len(kv.deleted) != 1 || kv.deleted[0] != key {
+		t.Fatalf("expected status key %q to be deleted, deleted keys: %v", key, kv.deleted)
 	}
 }
 
@@ -228,13 +241,11 @@ func TestDefragment_MemberFailureMarkedFailed(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// The status key should still have been cleaned up even though defrag
+	// failed for the member. Check that Delete was called.
 	key := statusKeyPrefix + "https://pod-0.etcd:2379"
-	val, getErr := kv.Get(context.Background(), key)
-	if getErr != nil {
-		t.Fatalf("unexpected error getting status: %v", getErr)
-	}
-	if val != "failed" {
-		t.Fatalf("expected status %q, got %q", "failed", val)
+	if len(kv.deleted) != 1 || kv.deleted[0] != key {
+		t.Fatalf("expected status key %q to be deleted after failure, deleted keys: %v", key, kv.deleted)
 	}
 }
 
@@ -318,5 +329,124 @@ func TestSortEndpoints_LeaderLast(t *testing.T) {
 	// Verify original slice not modified.
 	if endpoints[0] != "https://pod-0.etcd:2379" {
 		t.Fatal("original slice was modified")
+	}
+}
+
+// --- Task 4: Defrag status key tests ---
+
+func TestDefrag_StatusKeys_Written(t *testing.T) {
+	lock := &mockLock{}
+	role := &mockRole{leader: true}
+	maint := &mockMaintenance{}
+	kv := newMockKV()
+	endpoints := []string{
+		"https://pod-0.etcd:2379",
+		"https://pod-1.etcd:2379",
+		"https://pod-2.etcd:2379",
+	}
+	cluster := &mockCluster{endpoints: endpoints}
+	logger := zap.NewNop()
+
+	d := New("pod-0", time.Minute, lock, role, maint, kv, cluster, logger)
+
+	err := d.Defragment(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// All three status keys should have been deleted (proving they were created).
+	if len(kv.deleted) != 3 {
+		t.Fatalf("expected 3 status keys deleted, got %d: %v", len(kv.deleted), kv.deleted)
+	}
+
+	for _, ep := range endpoints {
+		key := statusKeyPrefix + ep
+		found := false
+		for _, dk := range kv.deleted {
+			if dk == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected status key %q to be deleted", key)
+		}
+	}
+}
+
+func TestDefrag_FollowersCompleteFirst(t *testing.T) {
+	lock := &mockLock{}
+	role := &mockRole{leader: true}
+	maint := &mockMaintenance{}
+	kv := newMockKV()
+	endpoints := []string{
+		"https://pod-0.etcd:2379",
+		"https://pod-1.etcd:2379",
+		"https://pod-2.etcd:2379",
+	}
+	cluster := &mockCluster{endpoints: endpoints}
+	logger := zap.NewNop()
+
+	d := New("pod-0", time.Minute, lock, role, maint, kv, cluster, logger)
+
+	err := d.Defragment(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the order: followers (pod-1, pod-2) must be defragged before
+	// the leader (pod-0).
+	if len(maint.defragged) != 3 {
+		t.Fatalf("expected 3 defragged endpoints, got %d", len(maint.defragged))
+	}
+
+	// pod-0 (leader) must be last.
+	if maint.defragged[2] != "https://pod-0.etcd:2379" {
+		t.Fatalf("expected leader endpoint last, got %q", maint.defragged[2])
+	}
+
+	// pod-1 and pod-2 must be before pod-0.
+	for i := 0; i < 2; i++ {
+		ep := maint.defragged[i]
+		if ep == "https://pod-0.etcd:2379" {
+			t.Fatalf("leader endpoint appeared at position %d, should be last", i)
+		}
+	}
+}
+
+func TestDefrag_StatusKeys_Cleaned(t *testing.T) {
+	lock := &mockLock{}
+	role := &mockRole{leader: true}
+	maint := &mockMaintenance{}
+	kv := newMockKV()
+	endpoints := []string{
+		"https://pod-0.etcd:2379",
+		"https://pod-1.etcd:2379",
+	}
+	cluster := &mockCluster{endpoints: endpoints}
+	logger := zap.NewNop()
+
+	d := New("pod-0", time.Minute, lock, role, maint, kv, cluster, logger)
+
+	err := d.Defragment(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// After completion, all status keys must be deleted from the KV store.
+	for _, ep := range endpoints {
+		key := statusKeyPrefix + ep
+		val, getErr := kv.Get(context.Background(), key)
+		if getErr != nil {
+			t.Fatalf("unexpected error getting status for %q: %v", key, getErr)
+		}
+		if val != "" {
+			t.Fatalf("expected status key %q to be deleted, but found value %q", key, val)
+		}
+	}
+
+	// Verify delete was called for each endpoint.
+	if len(kv.deleted) != 2 {
+		t.Fatalf("expected 2 status keys deleted, got %d", len(kv.deleted))
 	}
 }

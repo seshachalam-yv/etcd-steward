@@ -28,10 +28,17 @@ type WrapperClient interface {
 }
 
 // ClusterOperator abstracts etcd cluster membership operations needed during
-// bootstrap (e.g., removing a corrupted member).
+// bootstrap (e.g., removing a corrupted member, adding learners, promoting).
 type ClusterOperator interface {
 	// RemoveMember removes the member with the given name from the etcd cluster.
 	RemoveMember(ctx context.Context, memberName string) error
+	// MemberAddAsLearner adds this member to the cluster as a non-voting learner
+	// with the given peer URLs. It returns the assigned member ID.
+	MemberAddAsLearner(ctx context.Context, peerURLs []string) (uint64, error)
+	// MemberPromote promotes the learner member with the given ID to a voting member.
+	MemberPromote(ctx context.Context, memberID uint64) error
+	// MemberRemoveByID removes a member from the cluster by its numeric ID.
+	MemberRemoveByID(ctx context.Context, memberID uint64) error
 }
 
 // Recorder records state transitions during the bootstrap lifecycle.
@@ -47,4 +54,10 @@ type StateMachineProvider interface {
 	TriggerStartAsNew() error
 	// TriggerStartAsFollower triggers the transition for a member restored from snapshot.
 	TriggerStartAsFollower() error
+	// TriggerStartAsPendingLearner triggers the transition from Unknown to PendingLearner.
+	TriggerStartAsPendingLearner() error
+	// TriggerLearnerJoined triggers the transition from PendingLearner to Learner.
+	TriggerLearnerJoined() error
+	// TriggerPromoted triggers the transition from Learner to Follower.
+	TriggerPromoted() error
 }

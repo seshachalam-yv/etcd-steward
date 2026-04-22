@@ -35,6 +35,18 @@ type MemberInfo struct {
 	DBSizeInUse int64
 	// IsHealthy indicates whether the member is considered healthy.
 	IsHealthy bool
+	// SupplementaryInfo holds additional data collected from supplementary info
+	// providers, keyed by provider ID.
+	SupplementaryInfo map[string]map[string]interface{}
+}
+
+// SupplementaryInfoProvider supplies additional data to be included in the
+// EtcdMember status patch alongside the core member info.
+type SupplementaryInfoProvider interface {
+	// ID returns a unique identifier for this provider.
+	ID() string
+	// GetInfo returns additional data to include in the member status.
+	GetInfo(ctx context.Context) (map[string]interface{}, error)
 }
 
 // StateRecorder records member state transitions to an external system (e.g.,
@@ -53,9 +65,10 @@ type Updater struct {
 	recorder  StateRecorder
 	logger    *zap.Logger
 
-	mu        sync.RWMutex
-	providers []MemberInfoProvider
-	lastInfo  *MemberInfo
+	mu                      sync.RWMutex
+	providers               []MemberInfoProvider
+	supplementaryProviders  []SupplementaryInfoProvider
+	lastInfo                *MemberInfo
 }
 
 // NewUpdater creates an Updater.
@@ -81,6 +94,15 @@ func (u *Updater) RegisterInfoProvider(p MemberInfoProvider) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.providers = append(u.providers, p)
+}
+
+// RegisterSupplementaryProvider adds a SupplementaryInfoProvider to the updater.
+// Supplementary providers are queried after the core member info is collected
+// and their results are merged into MemberInfo.SupplementaryInfo.
+func (u *Updater) RegisterSupplementaryProvider(p SupplementaryInfoProvider) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.supplementaryProviders = append(u.supplementaryProviders, p)
 }
 
 // RecordStateTransition synchronously records a state transition by collecting
@@ -138,11 +160,14 @@ func (u *Updater) LastInfo() *MemberInfo {
 }
 
 // collectInfo queries registered providers for member info. The first provider
-// that returns successfully is used.
+// that returns successfully is used. Supplementary providers are then queried
+// and their results are merged into MemberInfo.SupplementaryInfo.
 func (u *Updater) collectInfo(ctx context.Context) (MemberInfo, error) {
 	u.mu.RLock()
 	providers := make([]MemberInfoProvider, len(u.providers))
 	copy(providers, u.providers)
+	suppProviders := make([]SupplementaryInfoProvider, len(u.supplementaryProviders))
+	copy(suppProviders, u.supplementaryProviders)
 	u.mu.RUnlock()
 
 	if len(providers) == 0 {
@@ -150,15 +175,39 @@ func (u *Updater) collectInfo(ctx context.Context) (MemberInfo, error) {
 	}
 
 	var lastErr error
+	var info MemberInfo
+	found := false
 	for _, p := range providers {
-		info, err := p.MemberInfo(ctx)
+		var err error
+		info, err = p.MemberInfo(ctx)
 		if err != nil {
 			lastErr = err
 			u.logger.Error("info provider failed", zap.Error(err))
 			continue
 		}
-		return info, nil
+		found = true
+		break
 	}
 
-	return MemberInfo{}, fmt.Errorf("all info providers failed, last error: %w", lastErr)
+	if !found {
+		return MemberInfo{}, fmt.Errorf("all info providers failed, last error: %w", lastErr)
+	}
+
+	// Collect supplementary info from all registered supplementary providers.
+	if len(suppProviders) > 0 {
+		info.SupplementaryInfo = make(map[string]map[string]interface{}, len(suppProviders))
+		for _, sp := range suppProviders {
+			data, err := sp.GetInfo(ctx)
+			if err != nil {
+				u.logger.Error("supplementary info provider failed",
+					zap.String("providerID", sp.ID()),
+					zap.Error(err),
+				)
+				continue
+			}
+			info.SupplementaryInfo[sp.ID()] = data
+		}
+	}
+
+	return info, nil
 }

@@ -11,9 +11,11 @@ import (
 	"github.com/gardener/etcd-steward/cmd/etcdsteward/compact"
 	"github.com/gardener/etcd-steward/cmd/etcdsteward/copybackups"
 	"github.com/gardener/etcd-steward/internal/config"
+	"github.com/gardener/etcd-steward/internal/member"
 	"github.com/gardener/etcd-steward/internal/snapstore"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.uber.org/zap"
 )
 
 // Version is set via ldflags at build time.
@@ -39,7 +41,21 @@ func newRootCommand() *cobra.Command {
 
 			fmt.Printf("etcd-steward daemon starting with %s snapstore (container=%s, prefix=%s)\n",
 				cfg.StoreProvider, cfg.StoreContainer, cfg.StorePrefix)
-			_ = store // TODO: pass store to daemon components
+
+			// Wire the SnapshotInfoProvider into the member Updater when a
+			// store is available. The Updater itself will be fully initialised
+			// once the daemon run-loop is implemented; for now we prepare the
+			// supplementary provider so it is ready to register.
+			logger, _ := zap.NewProduction()
+			defer func() { _ = logger.Sync() }()
+
+			if store != nil {
+				snapProvider := member.NewSnapshotInfoProvider(store, logger)
+				// TODO: register snapProvider with the member Updater once it
+				// is created in the daemon run-loop:
+				//   updater.RegisterSupplementaryProvider(snapProvider)
+				_ = snapProvider
+			}
 			return nil
 		},
 	}

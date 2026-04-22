@@ -188,6 +188,92 @@ func TestLastInfo_ReturnsCopyAfterUpdate(t *testing.T) {
 	}
 }
 
+// --- Supplementary provider tests ---
+
+type mockSupplementaryProvider struct {
+	id   string
+	data map[string]interface{}
+	err  error
+}
+
+func (m *mockSupplementaryProvider) ID() string { return m.id }
+
+func (m *mockSupplementaryProvider) GetInfo(_ context.Context) (map[string]interface{}, error) {
+	return m.data, m.err
+}
+
+func TestRecordStateTransition_WithSupplementaryProvider(t *testing.T) {
+	info := MemberInfo{ID: 1, Role: "Leader", DBSize: 1024}
+	provider := &mockInfoProvider{info: info}
+	suppProvider := &mockSupplementaryProvider{
+		id: "snapshot-info",
+		data: map[string]interface{}{
+			"lastFullSnapshotRevision":  int64(100),
+			"lastDeltaSnapshotRevision": int64(200),
+			"totalSnapshotCount":        3,
+			"accumulatedDeltaSize":      int64(5000),
+		},
+	}
+	rec := &mockStateRecorder{}
+	logger := zap.NewNop()
+
+	u := NewUpdater("pod-0", "ns", time.Second, rec, logger)
+	u.RegisterInfoProvider(provider)
+	u.RegisterSupplementaryProvider(suppProvider)
+
+	err := u.RecordStateTransition(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rec.recorded) != 1 {
+		t.Fatalf("expected 1 recorded state, got %d", len(rec.recorded))
+	}
+	recorded := rec.recorded[0]
+	if recorded.SupplementaryInfo == nil {
+		t.Fatal("expected non-nil SupplementaryInfo")
+	}
+	snapInfo, ok := recorded.SupplementaryInfo["snapshot-info"]
+	if !ok {
+		t.Fatal("expected snapshot-info key in SupplementaryInfo")
+	}
+	if v, ok := snapInfo["lastFullSnapshotRevision"].(int64); !ok || v != 100 {
+		t.Fatalf("expected lastFullSnapshotRevision=100, got %v", snapInfo["lastFullSnapshotRevision"])
+	}
+}
+
+func TestRecordStateTransition_SupplementaryProviderError_Skipped(t *testing.T) {
+	info := MemberInfo{ID: 1, Role: "Follower"}
+	provider := &mockInfoProvider{info: info}
+	failSuppProvider := &mockSupplementaryProvider{
+		id:  "failing-provider",
+		err: fmt.Errorf("snap list failed"),
+	}
+	rec := &mockStateRecorder{}
+	logger := zap.NewNop()
+
+	u := NewUpdater("pod-0", "ns", time.Second, rec, logger)
+	u.RegisterInfoProvider(provider)
+	u.RegisterSupplementaryProvider(failSuppProvider)
+
+	err := u.RecordStateTransition(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rec.recorded) != 1 {
+		t.Fatalf("expected 1 recorded state, got %d", len(rec.recorded))
+	}
+	// SupplementaryInfo should be initialised but empty since the provider failed.
+	recorded := rec.recorded[0]
+	if recorded.SupplementaryInfo == nil {
+		t.Fatal("expected non-nil SupplementaryInfo map")
+	}
+	if _, ok := recorded.SupplementaryInfo["failing-provider"]; ok {
+		t.Fatal("expected failing provider to be absent from SupplementaryInfo")
+	}
+}
+
 // --- InfoProvider tests ---
 
 func TestMaintenanceStatusProvider_Leader(t *testing.T) {

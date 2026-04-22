@@ -832,6 +832,19 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 			k8sClient,
 			logger.Named("member-lease"),
 		)
+		// Wire the InfoFunc so HolderIdentity is set to <memberID>:<role>
+		// format that druid's readyCheck expects.
+		leaseRenewer.SetInfoFunc(func(ctx context.Context) (uint64, string, error) {
+			statusResp, err := etcdClient.Status(ctx, cfg.EtcdEndpoints[0])
+			if err != nil {
+				return 0, "", fmt.Errorf("etcd status: %w", err)
+			}
+			role := "Member"
+			if statusResp.Leader == statusResp.Header.MemberId {
+				role = "Leader"
+			}
+			return statusResp.Header.MemberId, role, nil
+		})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

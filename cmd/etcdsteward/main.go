@@ -650,6 +650,15 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 
 	logger.Info("etcd is reachable, creating client")
 
+	// DEP-04: Ensure we've transitioned to Started now that etcd is running.
+	// For empty data dir (state=New), we need to go through Initializing first.
+	if sm.Current().State == statemachine.StateNew {
+		triggerSM(statemachine.ReasonDetectedPreviousUncleanExit, "transitioning through init")
+		triggerSM(statemachine.ReasonDBValidationSucceeded, "etcd started successfully")
+	} else if sm.Current().State == statemachine.StateInitializing {
+		triggerSM(statemachine.ReasonDBValidationSucceeded, "etcd started successfully")
+	}
+
 	// ----------------------------------------------------------------
 	// Create etcd client for runtime use
 	// ----------------------------------------------------------------

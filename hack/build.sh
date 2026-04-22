@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
+# SPDX-FileCopyrightText: 2025 SAP SE or an SAP affiliate company and Gardener contributors
 #
 # SPDX-License-Identifier: Apache-2.0
-
-
 
 set -e
 
@@ -15,7 +13,6 @@ echo "> Build..."
 
 cd "$SOURCE_PATH" &&
   CGO_ENABLED=0 GOOS=$(go env GOOS) GOARCH=$(go env GOARCH) GO111MODULE=on go build \
-    -mod vendor \
     -v \
     -o "${BINARY_PATH}"/etcd-steward \
-    main.go
+    ./cmd/etcdsteward/

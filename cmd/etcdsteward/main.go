@@ -318,34 +318,10 @@ func (p *leaderRoleProvider) IsLeader() bool {
 	return p.watcher.GetCurrentRole() == leaderwatch.Leader
 }
 
-// memberStateRecorderAdapter adapts statemachine.K8sRecorder to member.StateRecorder.
-type memberStateRecorderAdapter struct {
-	smRecorder *statemachine.K8sRecorder
-	sm         *statemachine.StateMachine
-}
-
-func (a *memberStateRecorderAdapter) RecordMemberState(ctx context.Context, memberName, namespace string, info member.MemberInfo) error {
-	// Map member role to a statemachine reason and trigger it.
-	var reason statemachine.Reason
-	switch info.Role {
-	case "Leader":
-		reason = statemachine.ReasonGainedClusterLeadership
-	case "Follower":
-		reason = statemachine.ReasonLostClusterLeadership
-	default:
-		// For other roles, just record without state machine transition.
-		return nil
-	}
-
-	t, err := a.sm.Trigger(reason, "")
-	if err != nil {
-		// Transition not valid from current state -- this is expected for
-		// repeated follower/leader states. Log and continue.
-		return nil
-	}
-
-	return a.smRecorder.Record(ctx, memberName, namespace, t)
-}
+// NOTE: memberStateRecorderAdapter has been replaced by member.K8sStateRecorder
+// which writes runtime data (id, dbSize, dbSizeInUse) directly to the EtcdMember
+// status sub-resource AND handles state machine transitions.
+// See internal/member/k8srecorder.go.
 
 func newRootCommand() *cobra.Command {
 	cfg := config.DefaultConfig()
@@ -453,6 +429,46 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	}()
 
 	// ----------------------------------------------------------------
+	// Create state machine early so transitions can be recorded from the
+	// very beginning of the initialization flow (DEP-04). The K8sRecorder
+	// needs a dynamic client which is created later, so we buffer
+	// transitions in-memory and flush them once the client is available.
+	// ----------------------------------------------------------------
+	isSingleNode := !isMultiNode(cfg)
+	sm := statemachine.New(isSingleNode)
+
+	// pendingTransitions accumulates transitions that occur before the K8s
+	// dynamic client is available. They are flushed after the client is created.
+	var pendingTransitions []statemachine.Transition
+
+	// triggerSM is a helper that triggers a state machine transition, logs the
+	// result, and appends successful transitions to the pending buffer.
+	triggerSM := func(reason statemachine.Reason, message string) {
+		t, err := sm.Trigger(reason, message)
+		if err != nil {
+			logger.Warn("state machine transition failed (expected if repeated)",
+				zap.String("reason", string(reason)),
+				zap.Error(err),
+			)
+			return
+		}
+		logger.Info("state machine transition",
+			zap.String("state", string(t.State)),
+			zap.String("subState", string(t.SubState)),
+			zap.String("reason", string(t.Reason)),
+			zap.String("message", t.Message),
+		)
+		pendingTransitions = append(pendingTransitions, t)
+	}
+
+	// Step 1 (DEP-04): Pod starts -> New
+	if isSingleNode {
+		triggerSM(statemachine.ReasonNewSingleNodeClusterCreated, "steward starting")
+	} else {
+		triggerSM(statemachine.ReasonClusterScaledUp, "steward starting")
+	}
+
+	// ----------------------------------------------------------------
 	// Step 1: Start HTTP server (/metrics, /healthz, /snapshot/*, AND
 	// backward-compatible /initialization/*, /config endpoints for old wrapper)
 	// DUAL-MODE: supports both old wrapper (polls /initialization/status)
@@ -529,8 +545,10 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 	if dataDirEmpty {
 		logger.Info("data directory is empty, skipping validation")
 	} else {
+		// Step 2 (DEP-04): New -> Initializing/DBValidationFull
+		triggerSM(statemachine.ReasonDetectedPreviousUncleanExit, "starting data validation")
+
 		// Perform a full validation check.
-		isSingleNode := !isMultiNode(cfg)
 		if err := val.FullCheck(isSingleNode); err != nil {
 			logger.Warn("full validation failed, data may be corrupt", zap.Error(err))
 		}
@@ -546,6 +564,9 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 
 	if corrupt {
 		logger.Warn("data directory is corrupt, cleaning up")
+		// Step 3b (DEP-04): Initializing/DBValidationFull -> Restoration (single) or New (multi)
+		triggerSM(statemachine.ReasonDBValidationFailed, "data corrupt or empty")
+
 		// TODO: For multi-node: remove self from cluster via etcd client
 		// before deleting data directory. This requires a cluster client
 		// which is not available yet (etcd is not running).
@@ -576,12 +597,16 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 				logger.Error("restore failed, etcd will start fresh", zap.Error(err))
 			} else {
 				needsRestore = true // deltas need to be applied after etcd starts
+				// Step 4 (DEP-04): Restoration -> Started/Leader
+				triggerSM(statemachine.ReasonRestorationSucceeded, "restored from backup")
 				logger.Info("full snapshot restored successfully")
 			}
 		}
 	} else if dataDirEmpty {
 		logger.Info("no backup store configured, etcd will start fresh")
 	} else {
+		// Step 3a (DEP-04): Initializing/DBValidationFull -> Started/Leader or Started/Follower
+		triggerSM(statemachine.ReasonDBValidationSucceeded, "data dir is valid")
 		logger.Info("data directory is valid, etcd will use existing data")
 	}
 
@@ -901,14 +926,35 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 
 	// 10h: EtcdMember updater (requires: K8s dynamic client).
 	if dynClient != nil {
-		sm := statemachine.New(!isMultiNode(cfg))
 		smRecorder := statemachine.NewK8sRecorder(dynClient)
 
-		// Create a member.StateRecorder that delegates to statemachine.K8sRecorder.
-		updaterRecorder := &memberStateRecorderAdapter{
-			smRecorder: smRecorder,
-			sm:         sm,
+		// Flush all transitions that were buffered before K8s client was available.
+		for _, pt := range pendingTransitions {
+			if err := smRecorder.Record(ctx, cfg.PodName, cfg.PodNamespace, pt); err != nil {
+				logger.Warn("failed to flush pending state machine transition to K8s",
+					zap.String("state", string(pt.State)),
+					zap.String("subState", string(pt.SubState)),
+					zap.String("reason", string(pt.Reason)),
+					zap.Error(err),
+				)
+			} else {
+				logger.Info("flushed pending state machine transition to EtcdMember",
+					zap.String("state", string(pt.State)),
+					zap.String("subState", string(pt.SubState)),
+					zap.String("reason", string(pt.Reason)),
+				)
+			}
 		}
+		pendingTransitions = nil // clear after flush
+
+		// Create a member.K8sStateRecorder that writes runtime data (id, dbSize,
+		// dbSizeInUse, state, subState, transitions) directly to the EtcdMember
+		// status sub-resource AND handles state machine transitions on role changes.
+		updaterRecorder := member.NewK8sStateRecorder(
+			dynClient,
+			sm,
+			logger.Named("member-k8s-recorder"),
+		)
 
 		updater := member.NewUpdater(
 			cfg.PodName,

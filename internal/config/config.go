@@ -103,6 +103,11 @@ type Config struct {
 	StorePrefix string
 	// StoreContainer is the bucket/container name (or root directory for Local).
 	StoreContainer string
+
+	// WrapperURL is the base URL for the etcd-wrapper sidecar HTTP API
+	// (e.g. "http://localhost:9095"). The steward sends the etcd config
+	// to POST /embedded-etcd and controls readiness via POST /readyz/set.
+	WrapperURL string
 }
 
 // DefaultConfig returns a Config populated with sensible default values.
@@ -140,5 +145,7 @@ func DefaultConfig() *Config {
 
 		StoreProvider:  "Local",
 		StoreContainer: "/var/etcd/data/snapshots",
+
+		WrapperURL: "http://localhost:9095",
 	}
 }

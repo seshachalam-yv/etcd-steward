@@ -69,6 +69,8 @@ func BindFlags(cfg *Config, fs *pflag.FlagSet) {
 	fs.StringVar(&cfg.StoreProvider, "store-provider", cfg.StoreProvider, "snapshot store provider (Local, S3, GCS, ABS)")
 	fs.StringVar(&cfg.StorePrefix, "store-prefix", cfg.StorePrefix, "key prefix under which snapshots are stored")
 	fs.StringVar(&cfg.StoreContainer, "store-container", cfg.StoreContainer, "bucket/container name or root directory for Local")
+
+	fs.StringVar(&cfg.WrapperURL, "wrapper-url", cfg.WrapperURL, "base URL for the etcd-wrapper sidecar HTTP API")
 }
 
 // LoadFromFile reads configuration from the file at the given path using viper.
@@ -142,6 +144,8 @@ func LoadFromFile(cfg *Config, path string, fs *pflag.FlagSet) error {
 	applyStringIfUnset(fs, v, "store-provider", &cfg.StoreProvider)
 	applyStringIfUnset(fs, v, "store-prefix", &cfg.StorePrefix)
 	applyStringIfUnset(fs, v, "store-container", &cfg.StoreContainer)
+
+	applyStringIfUnset(fs, v, "wrapper-url", &cfg.WrapperURL)
 
 	return nil
 }

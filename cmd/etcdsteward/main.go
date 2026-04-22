@@ -65,15 +65,11 @@ type configHandler struct {
 }
 
 func (h *configHandler) getConfig() ([]byte, error) {
-	// Try reading the mounted ConfigMap first.
-	data, err := os.ReadFile(etcdConfigPath)
-	if err == nil {
-		h.logger.Info("using etcd config from mounted ConfigMap", zap.String("path", etcdConfigPath))
-		return data, nil
-	}
-
-	// Fallback: generate from steward config flags.
-	h.logger.Info("mounted ConfigMap not found, generating etcd config from flags")
+	// Always generate config from flags. The druid-mounted ConfigMap uses
+	// a druid-specific format (per-member URL maps) that the wrapper's
+	// embed.ConfigFromFile cannot parse directly. The generated config
+	// uses flat etcd-native YAML that the wrapper understands.
+	h.logger.Info("generating etcd config from flags")
 	return h.generateEtcdConfig(), nil
 }
 
@@ -475,10 +471,6 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, status)
-		// Reset to New after Successful/Failed read (matching backup-restore behavior)
-		if status == "Successful" || status == "Failed" {
-			initStatus.Store("New")
-		}
 	}))
 
 	srv.RegisterHandler("/initialization/start", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

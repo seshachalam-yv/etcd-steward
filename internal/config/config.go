@@ -96,6 +96,13 @@ type Config struct {
 	RestorationTempDir string
 	// ConfigFile is the path to the configuration file.
 	ConfigFile string
+
+	// StoreProvider is the snapshot store provider (Local, S3, GCS, ABS).
+	StoreProvider string
+	// StorePrefix is the key prefix under which snapshots are stored.
+	StorePrefix string
+	// StoreContainer is the bucket/container name (or root directory for Local).
+	StoreContainer string
 }
 
 // DefaultConfig returns a Config populated with sensible default values.
@@ -130,5 +137,8 @@ func DefaultConfig() *Config {
 		CompactRevisionLag: 10000,
 
 		RestorationTempDir: "/var/etcd/data/restoration.tmp",
+
+		StoreProvider:  "Local",
+		StoreContainer: "/var/etcd/data/snapshots",
 	}
 }

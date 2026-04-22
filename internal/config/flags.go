@@ -65,6 +65,10 @@ func BindFlags(cfg *Config, fs *pflag.FlagSet) {
 	fs.StringVar(&cfg.DefragSchedule, "defrag-schedule", cfg.DefragSchedule, "cron schedule for defragmentation")
 	fs.StringVar(&cfg.RestorationTempDir, "restoration-temp-dir", cfg.RestorationTempDir, "temporary directory used during restoration")
 	fs.StringVar(&cfg.ConfigFile, "config-file", cfg.ConfigFile, "path to the configuration file")
+
+	fs.StringVar(&cfg.StoreProvider, "store-provider", cfg.StoreProvider, "snapshot store provider (Local, S3, GCS, ABS)")
+	fs.StringVar(&cfg.StorePrefix, "store-prefix", cfg.StorePrefix, "key prefix under which snapshots are stored")
+	fs.StringVar(&cfg.StoreContainer, "store-container", cfg.StoreContainer, "bucket/container name or root directory for Local")
 }
 
 // LoadFromFile reads configuration from the file at the given path using viper.
@@ -134,6 +138,10 @@ func LoadFromFile(cfg *Config, path string, fs *pflag.FlagSet) error {
 	applyStringIfUnset(fs, v, "delta-snapshot-lease-name", &cfg.DeltaSnapshotLeaseName)
 	applyStringIfUnset(fs, v, "defrag-schedule", &cfg.DefragSchedule)
 	applyStringIfUnset(fs, v, "restoration-temp-dir", &cfg.RestorationTempDir)
+
+	applyStringIfUnset(fs, v, "store-provider", &cfg.StoreProvider)
+	applyStringIfUnset(fs, v, "store-prefix", &cfg.StorePrefix)
+	applyStringIfUnset(fs, v, "store-container", &cfg.StoreContainer)
 
 	return nil
 }

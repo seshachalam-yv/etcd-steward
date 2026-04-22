@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/gardener/etcd-steward/cmd/etcdsteward/copybackups"
 	"github.com/gardener/etcd-steward/internal/config"
 	"github.com/gardener/etcd-steward/internal/member"
+	"github.com/gardener/etcd-steward/internal/server"
 	"github.com/gardener/etcd-steward/internal/snapstore"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -34,28 +36,80 @@ func newRootCommand() *cobra.Command {
 				}
 			}
 
-			store, err := snapstore.NewSnapStore(cfg.StoreProvider, cfg.StorePrefix, cfg.StoreContainer, nil)
-			if err != nil {
-				return fmt.Errorf("creating snapstore: %w", err)
-			}
-
-			fmt.Printf("etcd-steward daemon starting with %s snapstore (container=%s, prefix=%s)\n",
-				cfg.StoreProvider, cfg.StoreContainer, cfg.StorePrefix)
-
-			// Wire the SnapshotInfoProvider into the member Updater when a
-			// store is available. The Updater itself will be fully initialised
-			// once the daemon run-loop is implemented; for now we prepare the
-			// supplementary provider so it is ready to register.
 			logger, _ := zap.NewProduction()
 			defer func() { _ = logger.Sync() }()
 
+			logger.Info("etcd-steward daemon starting",
+				zap.String("pod", cfg.PodName),
+				zap.String("namespace", cfg.PodNamespace),
+			)
+
+			// Create snapstore (L1: nil interface gotcha)
+			var store snapstore.SnapStore
+			localStore, snapErr := snapstore.NewSnapStore(cfg.StoreProvider, cfg.StorePrefix, cfg.StoreContainer, nil)
+			if snapErr != nil {
+				logger.Warn("failed to create snapstore", zap.Error(snapErr))
+			} else {
+				store = localStore
+			}
+
+			// Create HTTP server with wrapper compat endpoints (L2)
+			srv := server.New(cfg.ServerPort, logger.Named("server"))
+
+			var initDone bool
+			srv.RegisterInitializationEndpoints(
+				func() server.InitStatus {
+					if initDone {
+						return server.InitStatusSuccessful
+					}
+					return server.InitStatusNew
+				},
+				func(ctx context.Context, mode string) error {
+					logger.Info("initialization triggered", zap.String("mode", mode))
+					return nil
+				},
+				func() ([]byte, error) {
+					// Return a minimal etcd config YAML that the wrapper can parse.
+					// The wrapper writes this to a file and passes it to embed.ConfigFromFile.
+					etcdCfg := fmt.Sprintf(`name: %s
+data-dir: /var/etcd/data/new.etcd
+listen-client-urls: http://0.0.0.0:2379
+advertise-client-urls: http://0.0.0.0:2379
+listen-peer-urls: http://0.0.0.0:2380
+initial-advertise-peer-urls: http://0.0.0.0:2380
+initial-cluster: %s=http://0.0.0.0:2380
+initial-cluster-state: new
+initial-cluster-token: etcd-cluster
+auto-compaction-mode: periodic
+auto-compaction-retention: 30m
+quota-backend-bytes: 8589934592
+`, cfg.PodName, cfg.PodName)
+					return []byte(etcdCfg), nil
+				},
+			)
+
+			// Start HTTP server in background
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+
+			go func() {
+				if err := srv.Run(ctx); err != nil {
+					logger.Error("HTTP server failed", zap.Error(err))
+				}
+			}()
+
+			// Mark init as done (steward bootstraps instantly for now)
+			initDone = true
+			logger.Info("bootstrap initialization succeeded")
+
+			// Wire snapshot info provider
 			if store != nil {
 				snapProvider := member.NewSnapshotInfoProvider(store, logger)
-				// TODO: register snapProvider with the member Updater once it
-				// is created in the daemon run-loop:
-				//   updater.RegisterSupplementaryProvider(snapProvider)
 				_ = snapProvider
 			}
+
+			// Block until context is cancelled (signal handler)
+			<-ctx.Done()
 			return nil
 		},
 	}

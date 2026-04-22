@@ -6,9 +6,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"time"
@@ -84,42 +82,21 @@ func (s *Server) RegisterInitializationEndpoints(
 	getConfig func() ([]byte, error),
 ) {
 	s.mux.HandleFunc("/initialization/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		resp := map[string]string{"status": string(getStatus())}
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			s.logger.Error("failed to encode initialization status", zap.Error(err))
-		}
+		status := getStatus()
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, string(status))
 	})
 
 	s.mux.HandleFunc("/initialization/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
+		// Accept both GET and POST — wrapper currently uses GET (with a TODO to switch to POST)
+		mode := r.URL.Query().Get("mode")
+		if mode == "" {
+			mode = "Full"
 		}
 
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
-			return
-		}
-		defer func() { _ = r.Body.Close() }()
-
-		var req struct {
-			Mode string `json:"mode"`
-		}
-		if len(body) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
-				http.Error(w, "invalid JSON body", http.StatusBadRequest)
-				return
-			}
-		}
-
-		if err := startInit(r.Context(), req.Mode); err != nil {
-			s.logger.Error("initialization start failed", zap.String("mode", req.Mode), zap.Error(err))
+		if err := startInit(r.Context(), mode); err != nil {
+			s.logger.Error("initialization start failed", zap.String("mode", mode), zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

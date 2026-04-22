@@ -325,21 +325,21 @@ type memberStateRecorderAdapter struct {
 }
 
 func (a *memberStateRecorderAdapter) RecordMemberState(ctx context.Context, memberName, namespace string, info member.MemberInfo) error {
-	// Map member role to a statemachine action and trigger it.
-	var action statemachine.Action
+	// Map member role to a statemachine reason and trigger it.
+	var reason statemachine.Reason
 	switch info.Role {
 	case "Leader":
-		action = statemachine.ActionWonElection
+		reason = statemachine.ReasonGainedClusterLeadership
 	case "Follower":
-		action = statemachine.ActionStartAsFollower
+		reason = statemachine.ReasonLostClusterLeadership
 	default:
 		// For other roles, just record without state machine transition.
 		return nil
 	}
 
-	t, err := a.sm.Trigger(action)
+	t, err := a.sm.Trigger(reason, "")
 	if err != nil {
-		// Transition not valid from current state — this is expected for
+		// Transition not valid from current state -- this is expected for
 		// repeated follower/leader states. Log and continue.
 		return nil
 	}
@@ -888,7 +888,7 @@ func runDaemon(cmd *cobra.Command, cfg *config.Config) error {
 
 	// 10h: EtcdMember updater (requires: K8s dynamic client).
 	if dynClient != nil {
-		sm := statemachine.New()
+		sm := statemachine.New(!isMultiNode(cfg))
 		smRecorder := statemachine.NewK8sRecorder(dynClient)
 
 		// Create a member.StateRecorder that delegates to statemachine.K8sRecorder.

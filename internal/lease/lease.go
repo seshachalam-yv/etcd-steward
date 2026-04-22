@@ -7,6 +7,7 @@ package lease
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,6 +16,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// InfoFunc returns the current member identity information used to build the
+// lease HolderIdentity.  The returned memberID is the etcd member's numeric ID,
+// and role is one of "Leader", "Member" (follower) or "Learner".
+type InfoFunc func(ctx context.Context) (memberID uint64, role string, err error)
 
 // Renewer periodically renews a Kubernetes coordination lease to indicate that
 // the etcd member is alive. If the lease does not exist it is created on the
@@ -26,9 +32,12 @@ type Renewer struct {
 	heartbeat time.Duration
 	client    kubernetes.Interface
 	logger    *zap.Logger
+	infoFunc  InfoFunc
 }
 
 // NewRenewer creates a Renewer that will maintain the given coordination lease.
+// An optional InfoFunc can be supplied via SetInfoFunc to populate the lease's
+// HolderIdentity with the etcd member ID and role.
 func NewRenewer(
 	podName string,
 	namespace string,
@@ -45,6 +54,13 @@ func NewRenewer(
 		client:    client,
 		logger:    logger,
 	}
+}
+
+// SetInfoFunc sets the InfoFunc used to obtain the etcd member ID and role for
+// building the lease HolderIdentity in the format expected by etcd-druid
+// (<memberID>:<role>).
+func (r *Renewer) SetInfoFunc(fn InfoFunc) {
+	r.infoFunc = fn
 }
 
 // Run starts the renewal loop that renews the lease at the configured heartbeat
@@ -71,6 +87,8 @@ func (r *Renewer) renew(ctx context.Context) {
 	leaseClient := r.client.CoordinationV1().Leases(r.namespace)
 	now := metav1.NewMicroTime(time.Now())
 
+	holderIdentity := r.holderIdentity(ctx)
+
 	existing, err := leaseClient.Get(ctx, r.leaseName, metav1.GetOptions{})
 	if err != nil {
 		// Lease does not exist — create it.
@@ -81,7 +99,7 @@ func (r *Renewer) renew(ctx context.Context) {
 				Namespace: r.namespace,
 			},
 			Spec: coordinationv1.LeaseSpec{
-				HolderIdentity:       strPtr(r.podName),
+				HolderIdentity:       strPtr(holderIdentity),
 				LeaseDurationSeconds: int32Ptr(leaseDurationSeconds(r.heartbeat)),
 				RenewTime:            &now,
 			},
@@ -95,7 +113,7 @@ func (r *Renewer) renew(ctx context.Context) {
 	}
 
 	// Update the existing lease.
-	existing.Spec.HolderIdentity = strPtr(r.podName)
+	existing.Spec.HolderIdentity = strPtr(holderIdentity)
 	existing.Spec.RenewTime = &now
 
 	if _, err := leaseClient.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
@@ -104,9 +122,39 @@ func (r *Renewer) renew(ctx context.Context) {
 	}
 
 	r.logger.Info("lease renewed", zap.String("lease", r.leaseName),
-		zap.String("holder", r.podName),
+		zap.String("holder", holderIdentity),
 		zap.String("renewTime", fmt.Sprintf("%v", now.Time)),
 	)
+}
+
+// holderIdentity returns the lease HolderIdentity string. When an InfoFunc is
+// configured and succeeds it returns "<memberID>:<role>", matching the format
+// expected by etcd-druid's readyCheck. Otherwise it falls back to the pod name.
+func (r *Renewer) holderIdentity(ctx context.Context) string {
+	if r.infoFunc == nil {
+		return r.podName
+	}
+	memberID, role, err := r.infoFunc(ctx)
+	if err != nil {
+		r.logger.Warn("InfoFunc failed, falling back to pod name for holder identity",
+			zap.Error(err))
+		return r.podName
+	}
+	return strconv.FormatUint(memberID, 10) + ":" + druidRole(role)
+}
+
+// druidRole maps the etcd-steward role string to the value expected by
+// etcd-druid (EtcdRoleLeader = "Leader", EtcdRoleMember = "Member").
+func druidRole(role string) string {
+	switch role {
+	case "Leader":
+		return "Leader"
+	case "Follower":
+		return "Member"
+	default:
+		// "Learner" or any unknown role — pass through so the druid can decide.
+		return role
+	}
 }
 
 func strPtr(s string) *string {

@@ -31,7 +31,8 @@ type Recorder interface {
 }
 
 // K8sRecorder records state transitions by patching the EtcdMember status
-// via the Kubernetes dynamic client.
+// via the Kubernetes dynamic client. It updates both the current state fields
+// (state, subState) and appends to the transitions array.
 type K8sRecorder struct {
 	client dynamic.Interface
 }
@@ -42,16 +43,26 @@ func NewK8sRecorder(client dynamic.Interface) *K8sRecorder {
 }
 
 // Record patches the EtcdMember status sub-resource with the transition details.
+// It sets the top-level state and subState fields and records the transition
+// with State, SubState, Reason, TransitionTime, and Message.
 func (r *K8sRecorder) Record(ctx context.Context, memberName, namespace string, t Transition) error {
+	transition := map[string]interface{}{
+		"state":          string(t.State),
+		"reason":         string(t.Reason),
+		"transitionTime": t.TransitionTime.UTC().Format("2006-01-02T15:04:05Z"),
+	}
+	if t.SubState != SubStateNone {
+		transition["subState"] = string(t.SubState)
+	}
+	if t.Message != "" {
+		transition["message"] = t.Message
+	}
+
 	patch := map[string]interface{}{
 		"status": map[string]interface{}{
-			"state": string(t.To),
-			"lastTransition": map[string]interface{}{
-				"from":   string(t.From),
-				"to":     string(t.To),
-				"action": string(t.Action),
-				"time":   t.Time.UTC().Format("2006-01-02T15:04:05Z"),
-			},
+			"state":          string(t.State),
+			"subState":       string(t.SubState),
+			"lastTransition": transition,
 		},
 	}
 
